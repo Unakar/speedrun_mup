@@ -1,403 +1,290 @@
 #!/usr/bin/env python3
 """
-Main training script for speedrun-mup experiments.
+Speedrun-MuP training script.
 
-This script demonstrates the complete MuP workflow:
-1. Load configuration
-2. Create MuP-aware models
-3. Set up logging and validation
-4. Train with comprehensive metrics
+Simple, clean implementation based on modded-nanogpt with MuP integration.
 """
 
 import os
 import sys
 import argparse
-import torch
-import torch.nn as nn
+import time
 from pathlib import Path
-import yaml
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add core to path
+sys.path.insert(0, str(Path(__file__).parent.parent / 'core'))
 
-from speedrun_mup.config import ExperimentConfig, MuPConfig, ScalingConfig
-from speedrun_mup.models import GPTMuP, apply_mup, make_mup_model
-from speedrun_mup.models.gpt import GPTConfig
-from speedrun_mup.logging import WandBLogger, MetricsCollector, SpectralMonitor
-from speedrun_mup.validation import coord_check, plot_coord_data
-from speedrun_mup.utils import set_base_shapes, setup_distributed, cleanup_distributed
+import torch
+import torch.nn.functional as F
+
+# Core imports
+from model import GPT, GPTConfig
+from mup import MuPConfig, apply_mup, create_mup_optimizer
+from utils import (
+    setup_distributed, cleanup_distributed, get_rank, is_main_process,
+    MetricsLogger, Timer, compute_grad_norm, get_model_info, 
+    save_checkpoint, set_seed, estimate_mfu
+)
+
+
+def create_dummy_data_loader(batch_size: int, seq_len: int, vocab_size: int = 50304):
+    """Create dummy data loader for testing."""
+    def data_gen():
+        while True:
+            # Generate random sequences
+            input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+            targets = torch.randint(0, vocab_size, (batch_size, seq_len))
+            yield input_ids, targets
+    
+    return data_gen()
 
 
 def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Train MuP-aware GPT model')
+    parser = argparse.ArgumentParser(description='Train GPT with MuP')
     
-    parser.add_argument('--config', type=str, required=True,
-                       help='Path to experiment configuration YAML')
-    parser.add_argument('--mup-config', type=str, default=None,
-                       help='Path to MuP-specific configuration YAML')
-    parser.add_argument('--run-name', type=str, default=None,
-                       help='Override run name')
-    parser.add_argument('--no-wandb', action='store_true',
-                       help='Disable W&B logging')
-    parser.add_argument('--coord-check-only', action='store_true',
-                       help='Only run coordinate checking, skip training')
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device to use for training')
+    # Model config
+    parser.add_argument('--model-dim', type=int, default=768)
+    parser.add_argument('--num-heads', type=int, default=12) 
+    parser.add_argument('--num-layers', type=int, default=12)
+    parser.add_argument('--vocab-size', type=int, default=50304)
+    parser.add_argument('--max-seq-len', type=int, default=1024)
+    
+    # MuP config
+    parser.add_argument('--use-mup', action='store_true', default=True)
+    parser.add_argument('--base-width', type=int, default=768)
+    parser.add_argument('--coord-check', action='store_true')
+    
+    # Training config
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--seq-len', type=int, default=1024)
+    parser.add_argument('--learning-rate', type=float, default=3e-4)
+    parser.add_argument('--weight-decay', type=float, default=0.1)
+    parser.add_argument('--grad-clip', type=float, default=1.0)
+    parser.add_argument('--max-iters', type=int, default=1000)
+    parser.add_argument('--warmup-iters', type=int, default=100)
+    
+    # Logging
+    parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--eval-interval', type=int, default=100)
+    parser.add_argument('--save-interval', type=int, default=500)
+    parser.add_argument('--wandb', action='store_true')
+    parser.add_argument('--log-dir', type=str, default='./logs')
+    
+    # System
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--compile', action='store_true')
+    parser.add_argument('--seed', type=int, default=1337)
     
     return parser.parse_args()
 
 
-def load_config(config_path: str, mup_config_path: str = None) -> tuple:
-    """Load experiment and MuP configurations."""
-    # Load main experiment config
-    exp_config = ExperimentConfig.from_yaml(config_path)
+def get_lr(iter_num: int, warmup_iters: int, max_iters: int, 
+           learning_rate: float, min_lr: float = 0.0):
+    """Get learning rate with warmup and cosine decay."""
+    if iter_num < warmup_iters:
+        return learning_rate * iter_num / warmup_iters
     
-    # Load MuP config if provided
-    if mup_config_path:
-        with open(mup_config_path, 'r') as f:
-            mup_dict = yaml.safe_load(f)
-        mup_config = MuPConfig(**mup_dict.get('mup', {}))
-        scaling_config = ScalingConfig(**mup_dict.get('scaling', {}))
-    else:
-        mup_config = MuPConfig()
-        scaling_config = ScalingConfig()
+    if iter_num > max_iters:
+        return min_lr
     
-    return exp_config, mup_config, scaling_config
+    decay_ratio = (iter_num - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
 
 
-def create_model(
-    scaling_config: ScalingConfig,
-    mup_config: MuPConfig,
-    use_mup: bool = True
-) -> tuple:
-    """Create model with MuP parameterization."""
+def run_coordinate_check(args):
+    """Run coordinate checking across different widths."""
+    print("Running coordinate check...")
     
-    def model_factory(**config_kwargs):
-        """Factory function to create models with different configurations."""
-        gpt_config = GPTConfig(**config_kwargs)
-        return GPTMuP(gpt_config)
+    from mup import coord_check, plot_coord_check
     
-    if use_mup:
-        # Get model configurations
-        base_config = scaling_config.get_base_config()
-        target_config = scaling_config.get_target_config()
-        delta_config = scaling_config.get_delta_config()
-        
-        # Create models
-        base_model = model_factory(**base_config.__dict__)
-        target_model = model_factory(**target_config.__dict__)
-        
-        # Apply MuP parameterization
-        if mup_config.base_shapes_file and os.path.exists(mup_config.base_shapes_file):
-            # Load pre-computed base shapes
-            base_shapes = torch.load(mup_config.base_shapes_file)
-            apply_mup(target_model, base_model, base_shapes=base_shapes)
-        else:
-            # Compute base shapes
-            delta_model = model_factory(**delta_config.__dict__)
-            apply_mup(target_model, base_model, delta_model)
-            
-            # Save base shapes if requested
-            if mup_config.save_base_shapes and mup_config.base_shapes_file:
-                from speedrun_mup.utils.shapes import make_base_shapes, save_base_shapes
-                base_shapes = make_base_shapes(base_model, delta_model)
-                save_base_shapes(base_shapes, mup_config.base_shapes_file)
-        
-        return target_model, base_model
-    else:
-        # Standard model without MuP
-        target_config = scaling_config.get_target_config()
-        model = model_factory(**target_config.__dict__)
-        return model, None
-
-
-def run_coordinate_check(
-    base_model: nn.Module,
-    scaling_config: ScalingConfig,
-    mup_config: MuPConfig,
-    device: str,
-    save_dir: str
-) -> bool:
-    """Run coordinate checking to validate MuP implementation."""
-    print("Running coordinate checking...")
+    widths = [256, 512, 768, 1024]
     
-    def model_factory(width: int):
-        """Create model with specified width."""
-        config = scaling_config.get_base_config()
-        config.n_embd = width
-        config.n_head = max(1, width // 64)  # Adjust heads proportionally
-        while config.n_embd % config.n_head != 0:
-            config.n_head -= 1
-        
-        model = GPTMuP(config)
-        
-        # Apply MuP if base model provided
-        if base_model is not None:
-            # Create a delta model for base shapes
-            delta_config = config
-            delta_config.n_embd = width * 2  # Different width for delta
-            delta_model = GPTMuP(delta_config)
-            
-            apply_mup(model, base_model, delta_model)
-        
-        return model
+    def model_factory(width):
+        config = GPTConfig(
+            vocab_size=args.vocab_size,
+            max_seq_len=args.max_seq_len,
+            model_dim=width,
+            num_heads=max(1, width // 64),
+            num_layers=args.num_layers
+        )
+        return GPT(config)
     
-    # Test different widths
-    widths = [256, 512, 1024]
+    results = coord_check(model_factory, widths, device=args.device)
+    plot_coord_check(results, save_path=f"{args.log_dir}/coord_check.png")
     
-    # Run coordinate check
-    coord_results = coord_check(
-        model_factory=model_factory,
-        widths=widths,
-        n_steps=mup_config.coord_check_nsteps,
-        n_seeds=mup_config.coord_check_nseeds,
-        device=device
-    )
-    
-    # Plot results
-    save_path = os.path.join(save_dir, 'coordinate_check.png')
-    plot_coord_data(
-        coord_results,
-        save_path=save_path,
-        title="MuP Coordinate Check"
-    )
-    
-    # Validate results
-    from speedrun_mup.validation.coord_check import validate_mup_coordinates
-    validation_results = validate_mup_coordinates(
-        coord_results,
-        tolerance=mup_config.coord_check_tolerance
-    )
-    
-    # Print validation summary
-    print("\nCoordinate Check Results:")
-    print("=" * 40)
-    all_passed = True
-    for layer_name, passed in validation_results.items():
-        status = "PASS" if passed else "FAIL"
-        print(f"{layer_name}: {status}")
-        if not passed:
-            all_passed = False
-    
-    if all_passed:
-        print("\n✅ All coordinate checks passed!")
-    else:
-        print("\n❌ Some coordinate checks failed!")
-        print("Consider adjusting MuP parameterization.")
-    
-    return all_passed
-
-
-def create_dummy_data_loader(batch_size: int, seq_len: int, vocab_size: int, device: str):
-    """Create a dummy data loader for testing."""
-    class DummyDataset:
-        def __init__(self, size=1000):
-            self.size = size
-        
-        def __iter__(self):
-            for _ in range(self.size):
-                input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-                yield {'input_ids': input_ids, 'labels': input_ids}
-    
-    return DummyDataset()
+    return results
 
 
 def main():
-    """Main training loop."""
     args = parse_args()
     
-    # Load configuration
-    exp_config, mup_config, scaling_config = load_config(args.config, args.mup_config)
-    
-    # Override run name if provided
-    if args.run_name:
-        exp_config.logging.wandb_run_name = args.run_name
-    
-    # Disable wandb if requested
-    if args.no_wandb:
-        exp_config.logging.use_wandb = False
-    
-    # Setup distributed training if needed
+    # Setup
+    set_seed(args.seed)
     setup_distributed()
     
-    # Set device
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    torch.manual_seed(exp_config.seed)
+    if is_main_process():
+        os.makedirs(args.log_dir, exist_ok=True)
+        print(f"Training GPT with MuP: {args}")
     
-    # Create output directories
-    os.makedirs(exp_config.out_dir, exist_ok=True)
-    os.makedirs(exp_config.logging.log_dir, exist_ok=True)
-    
-    # Create model
-    print("Creating model...")
-    model, base_model = create_model(scaling_config, mup_config, use_mup=mup_config.use_mup)
-    model = model.to(device)
-    
-    print(f"Model created with {model.get_num_params():,} parameters")
-    
-    # Run coordinate checking
-    if mup_config.coord_check_enabled:
-        coord_check_passed = run_coordinate_check(
-            base_model, scaling_config, mup_config, args.device, exp_config.out_dir
-        )
-        
-        if args.coord_check_only:
-            print("Coordinate checking complete. Exiting.")
-            return
-        
-        if not coord_check_passed:
-            print("Warning: Coordinate checks failed. Training may not follow MuP assumptions.")
+    # Run coordinate check if requested
+    if args.coord_check:
+        run_coordinate_check(args)
+        if is_main_process():
+            print("Coordinate check complete. Exiting.")
+        cleanup_distributed()
+        return
     
     # Initialize logging
-    wandb_logger = None
-    if exp_config.logging.use_wandb:
-        wandb_logger = WandBLogger(
-            exp_config.logging,
-            project_config=exp_config.to_dict(),
-            model_config=model.config.__dict__
-        )
-        wandb_logger.log_model_info(model, model.config.__dict__)
-        wandb_logger.log_system_info()
+    logger = MetricsLogger(
+        project_name="speedrun-mup",
+        use_wandb=args.wandb and is_main_process(),
+        log_dir=args.log_dir if is_main_process() else None
+    )
+    timer = Timer()
     
-    # Initialize metrics collection
-    metrics_collector = MetricsCollector(
-        model,
-        collect_activations=exp_config.logging.log_activations,
-        activation_frequency=exp_config.logging.activation_log_interval
+    # Create model
+    config = GPTConfig(
+        vocab_size=args.vocab_size,
+        max_seq_len=args.max_seq_len,
+        model_dim=args.model_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers
     )
     
-    # Initialize spectral monitoring
-    spectral_monitor = None
-    if exp_config.logging.log_spectral:
-        spectral_monitor = SpectralMonitor(model)
+    model = GPT(config).to(args.device)
     
-    # Create optimizer with MuP-appropriate learning rates
-    if mup_config.use_mup:
-        from speedrun_mup.models.mup_integration import create_mup_param_groups
-        param_groups = create_mup_param_groups(model, exp_config.training.learning_rate)
+    if is_main_process():
+        model_info = get_model_info(model)
+        print(f"Model: {model_info}")
+        logger.log(model_info)
+    
+    # Apply MuP
+    mup_config = MuPConfig(
+        base_width=args.base_width,
+        target_width=args.model_dim,
+        use_mup=args.use_mup
+    )
+    
+    if args.use_mup:
+        apply_mup(model, mup_config)
+        if is_main_process():
+            print(f"Applied MuP scaling: {args.base_width} -> {args.model_dim}")
+    
+    # Create optimizer
+    if args.use_mup:
+        optimizer = create_mup_optimizer(model, args.learning_rate, args.weight_decay, mup_config)
     else:
-        param_groups = [{'params': model.parameters(), 'lr': exp_config.training.learning_rate}]
+        optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=args.learning_rate, 
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.95)
+        )
     
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        betas=(exp_config.training.beta1, exp_config.training.beta2),
-        weight_decay=exp_config.training.weight_decay
-    )
+    # Compile model
+    if args.compile:
+        model = torch.compile(model)
+        if is_main_process():
+            print("Model compiled")
     
-    # Create dummy data loader (replace with real data loading)
-    data_loader = create_dummy_data_loader(
-        exp_config.training.micro_batch_size,
-        exp_config.training.block_size,
-        model.config.vocab_size,
-        device
-    )
+    # Create data loader
+    data_loader = create_dummy_data_loader(args.batch_size, args.seq_len, args.vocab_size)
     
     # Training loop
-    print("Starting training...")
     model.train()
+    best_loss = float('inf')
     
-    data_iter = iter(data_loader)
-    for step in range(exp_config.training.max_iters):
+    if is_main_process():
+        print("Starting training...")
+    
+    for iter_num in range(args.max_iters):
+        timer.start()
+        
+        # Get learning rate
+        lr = get_lr(iter_num, args.warmup_iters, args.max_iters, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr * getattr(param_group, 'lr_mul', 1.0)
+        
         # Get batch
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(data_loader)
-            batch = next(data_iter)
+        input_ids, targets = next(data_loader)
+        input_ids = input_ids.to(args.device)
+        targets = targets.to(args.device)
         
-        # Start metrics collection
-        metrics_collector.step_start()
-        
-        # Forward pass
-        optimizer.zero_grad()
-        outputs = model(batch['input_ids'], labels=batch['labels'])
-        loss = outputs['loss']
+        # Forward pass - reshape for model input format
+        if input_ids.dim() == 2:  # (batch, seq) -> (seq,) for each sample
+            losses = []
+            for i in range(input_ids.size(0)):
+                seq_input = input_ids[i]  # (seq,)
+                seq_target = targets[i]   # (seq,)
+                loss = model(seq_input, seq_target)
+                losses.append(loss)
+            loss = torch.stack(losses).mean()
+        else:
+            loss = model(input_ids, targets)
         
         # Backward pass
+        optimizer.zero_grad()
         loss.backward()
         
         # Gradient clipping
-        if exp_config.training.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), exp_config.training.grad_clip)
+        grad_norm = compute_grad_norm(model)
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         
         # Optimizer step
         optimizer.step()
         
-        # End metrics collection
-        metrics_collector.step_end()
+        # Timing
+        step_time = timer.stop()
+        tokens_per_sec = timer.throughput(args.batch_size, args.seq_len)
         
-        # Collect metrics
-        if step % exp_config.logging.log_interval == 0:
-            # Collect comprehensive metrics
-            mup_metrics = metrics_collector.collect_metrics(loss, optimizer)
-            summary_metrics = metrics_collector.get_summary_metrics()
+        # Logging
+        if iter_num % args.log_interval == 0:
+            # Estimate MFU
+            mfu = estimate_mfu(
+                model_info.get('total_params', 0) if 'model_info' in locals() else 0,
+                args.batch_size, args.seq_len, step_time
+            )
             
-            # Log to console
-            print(f"Step {step}: loss={loss.item():.4f}, "
-                  f"grad_norm={summary_metrics.get('grad_norm_smooth', 0):.4f}")
-            
-            # Log to wandb
-            if wandb_logger:
-                wandb_logger.log_training_metrics(
-                    loss=loss.item(),
-                    learning_rate=optimizer.param_groups[0]['lr'],
-                    grad_norm=summary_metrics.get('grad_norm_smooth'),
-                    step_time=summary_metrics.get('step_time'),
-                    step=step
-                )
-                wandb_logger.log_mup_metrics(mup_metrics, step=step)
-        
-        # Spectral monitoring
-        if (spectral_monitor and step > 0 and 
-            step % exp_config.logging.spectral_log_interval == 0):
-            spectral_stats = spectral_monitor.compute_spectral_stats()
-            spectral_summary = spectral_monitor.get_summary_metrics(spectral_stats)
-            
-            print(f"Spectral norms - mean: {spectral_summary.get('spectral_norm_mean', 0):.4f}")
-            
-            if wandb_logger:
-                wandb_logger.log_spectral_stats(spectral_stats, step=step)
-                wandb_logger.log_metrics(spectral_summary, step=step, prefix="spectral_summary")
-        
-        # Save checkpoint
-        if step > 0 and step % exp_config.training.save_interval == 0:
-            checkpoint = {
-                'step': step,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': exp_config.to_dict(),
-                'mup_config': mup_config.__dict__,
-                'scaling_config': scaling_config.__dict__,
+            metrics = {
+                'loss': loss.item(),
+                'lr': lr,
+                'grad_norm': grad_norm,
+                'step_time': step_time,
+                'tokens_per_sec': tokens_per_sec,
+                'mfu': mfu,
+                'iter': iter_num
             }
             
-            save_path = os.path.join(exp_config.out_dir, f'checkpoint_{step}.pt')
-            torch.save(checkpoint, save_path)
-            print(f"Saved checkpoint: {save_path}")
+            logger.log(metrics, step=iter_num)
+            
+            if is_main_process():
+                logger.print_metrics()
+        
+        # Save checkpoint
+        if iter_num > 0 and iter_num % args.save_interval == 0 and is_main_process():
+            checkpoint_path = f"{args.log_dir}/checkpoint_{iter_num}.pt"
+            save_checkpoint(
+                model, optimizer, iter_num, loss.item(),
+                vars(args), checkpoint_path
+            )
+        
+        # Track best loss
+        if loss.item() < best_loss:
+            best_loss = loss.item()
     
     # Final checkpoint
-    final_checkpoint = {
-        'step': exp_config.training.max_iters,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'config': exp_config.to_dict(),
-        'mup_config': mup_config.__dict__,
-        'scaling_config': scaling_config.__dict__,
-    }
-    
-    final_save_path = os.path.join(exp_config.out_dir, 'final_model.pt')
-    torch.save(final_checkpoint, final_save_path)
-    print(f"Saved final model: {final_save_path}")
+    if is_main_process():
+        final_path = f"{args.log_dir}/final_model.pt"
+        save_checkpoint(model, optimizer, args.max_iters, best_loss, vars(args), final_path)
+        print(f"Training complete. Best loss: {best_loss:.4f}")
     
     # Cleanup
-    metrics_collector.cleanup()
-    if wandb_logger:
-        wandb_logger.finish()
-    
+    logger.close()
     cleanup_distributed()
-    
-    print("Training complete!")
 
 
 if __name__ == '__main__':
+    import math  # For LR scheduling
     main()

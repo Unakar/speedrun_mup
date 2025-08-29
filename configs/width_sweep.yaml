@@ -1,0 +1,61 @@
+# Width sweep experiment for MuP validation
+# Tests hyperparameter transfer across different widths
+
+base_config:
+  model:
+    num_layers: 12
+    vocab_size: 50304
+    max_seq_len: 1024
+    use_fp8: true
+    use_flex_attention: true
+    use_skip_connections: true
+    num_value_embeds: 3
+
+  training:
+    batch_size: 8
+    seq_len: 1024
+    learning_rate: 3e-4
+    weight_decay: 0.1
+    grad_clip: 1.0
+    max_iters: 1000
+    warmup_iters: 100
+
+  mup:
+    use_mup: true
+    base_width: 256  # Base reference width
+    init_std: 0.02
+
+  logging:
+    log_interval: 10
+    save_interval: 500
+    use_wandb: false
+
+  system:
+    device: "cuda"
+    compile: false
+    seed: 1337
+
+# Width configurations to test
+widths:
+  - width: 256
+    num_heads: 4
+    target_width: 256
+    
+  - width: 512  
+    num_heads: 8
+    target_width: 512
+    
+  - width: 768
+    num_heads: 12
+    target_width: 768
+    
+  - width: 1024
+    num_heads: 16
+    target_width: 1024
+
+# Coordinate checking settings
+coord_check:
+  enabled: true
+  widths: [256, 512, 768, 1024]
+  n_steps: 3
+  save_plots: true

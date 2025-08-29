@@ -11,6 +11,23 @@ Speedrun-MuP combines the world-record training speed of modded-nanogpt with the
 - **Comprehensive validation** through coordinate checking and spectral monitoring
 - **Research-ready metrics** with automatic plotting and W&B integration
 
+  speedrun_mup/
+  ├── core/                    # Clean, concise implementation
+  │   ├── __init__.py         # Simple package initialization
+  │   ├── model.py            # GPT implementation following modded-nanogpt
+  │   ├── mup.py              # MuP scaling and coordinate checking
+  │   └── utils.py            # Consolidated logging and utilities
+  ├── scripts/                # Executable training scripts
+  │   ├── train.py           # Main training script with MuP
+  │   └── coord_check.py     # Coordinate validation
+  ├── configs/                # Simplified YAML configurations
+  │   ├── gpt_small_mup.yaml # Basic GPT-small config
+  │   └── width_sweep.yaml   # Width experiments config
+  ├── claude_instructions/    # Preserved unchanged
+  └── origin_repos/          # Preserved unchanged
+      ├── modded-nanogpt/
+      └── mup/
+
 ## Quick Start
 
 ### 1. Coordinate Checking
@@ -80,29 +97,6 @@ speedrun_mup/
 └── analysis/             # Notebooks and plotting utilities
 ```
 
-## Understanding MuP
-
-### What is μP?
-
-Maximal Update Parameterization (μP) is a neural network parameterization that keeps activations, gradients, and updates at the same scale as you increase model width. This means:
-
-1. **Optimal hyperparameters remain stable** across different model sizes
-2. **No expensive retuning** when scaling up models
-3. **Predictable training dynamics** regardless of width
-
-### Key MuP Rules
-
-1. **Initialization**: Matrix weights scale as `σ² ∝ 1/width`
-2. **Learning rates**: Hidden layer LR scales as `η ∝ 1/width`
-3. **Output scaling**: Language model head uses `1/width` scaling
-4. **Attention**: Use `1/d_head` instead of `1/√d_head` scaling
-
-### Validation
-
-MuP correctness is validated through **coordinate checking**:
-- Train models at different widths for a few steps
-- Plot activation statistics vs width
-- Verify activations remain O(1) (don't grow/shrink with width)
 
 ## Troubleshooting
 
