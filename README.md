@@ -1,6 +1,6 @@
 # Speedrun-MuP 🚀
 
-A clean, engineering-grade experimental stack for **Maximal Update Parameterization (μP)** scaling experiments built on top of the modded-nanogpt "speedrun" architecture.
+A clean experimental stack for **Maximal Update Parameterization (μP)** scaling experiments built on top of the modded-nanogpt "speedrun" architecture.
 
 ## Overview
 
@@ -10,50 +10,6 @@ Speedrun-MuP combines the world-record training speed of modded-nanogpt with the
 - **Competitive training speed** with modern optimizations (FlexAttention, FP8, Muon optimizer)
 - **Comprehensive validation** through coordinate checking and spectral monitoring
 - **Research-ready metrics** with automatic plotting and W&B integration
-
-## Key Features
-
-### 🔬 MuP Integration
-- **Complete μP implementation** with proper initialization and learning rate scaling
-- **Coordinate checking** to validate width-invariant activations
-- **Spectral monitoring** for higher-order μP validation
-- **Hyperparameter transfer** testing across model scales
-
-### ⚡ Performance Optimizations
-- **FlexAttention** with sliding window patterns
-- **U-Net skip connections** for better gradient flow
-- **RoPE position encodings** with half-truncated frequencies
-- **Mixed precision training** (FP8/BF16/FP32)
-- **Value embeddings** for richer representations
-
-### 📊 Comprehensive Logging
-- **Weights & Biases** integration with MuP-specific metrics
-- **Activation statistics** tracking across layers
-- **Gradient and parameter norms** monitoring
-- **Spectral properties** analysis (optional)
-- **Automated plotting** for validation curves
-
-### 🧪 Experimental Framework
-- **Configuration-driven** experiments with YAML configs
-- **Reproducible runs** with deterministic seeding
-- **Distributed training** support for multi-GPU setups
-- **Checkpoint management** with resumable training
-
-## Installation
-
-```bash
-git clone <repository-url>
-cd speedrun_mup
-pip install -r requirements.txt
-```
-
-### Requirements
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.8+ (for GPU training)
-- wandb (optional, for logging)
-- matplotlib (for plotting)
-- PyYAML (for configuration)
 
 ## Quick Start
 
@@ -161,7 +117,7 @@ MuP correctness is validated through **coordinate checking**:
 python scripts/coord_check.py --widths 256 512 --n-steps 5
 ```
 
-## References
+## Recommand links (kexue.fm is all you need)
 
 - [Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer](https://arxiv.org/abs/2203.03466)
 - [μP Practitioner's Guide](https://www.cerebras.ai/blog/the-practitioners-guide-to-the-maximal-update-parameterization)
@@ -169,5 +125,3 @@ python scripts/coord_check.py --widths 256 512 --n-steps 5
 - [Higher-order μP Spectral Conditions](https://kexue.fm/archives/10795)
 
 ---
-
-Built with ❤️ for scalable, principled neural network training.
