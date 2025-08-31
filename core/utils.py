@@ -211,9 +211,10 @@ class SimpleLogger:
         if not is_main_process():
             return
             
-        # Log to wandb if available
+        # Log to wandb with organized grouping if available
         if self.wandb:
-            self.wandb.log(metrics)
+            grouped_metrics = self._group_metrics_for_wandb(metrics)
+            self.wandb.log(grouped_metrics)
         
         # Log to file with timestamp
         if self.log_file:
@@ -222,6 +223,41 @@ class SimpleLogger:
             metrics_str = ', '.join([f"{k}={v}" for k, v in metrics.items()])
             self.log_file.write(f"[{timestamp}] {metrics_str}\n")
             self.log_file.flush()
+    
+    def _group_metrics_for_wandb(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        """Group metrics by category for better wandb organization."""
+        grouped = {}
+        
+        # Define metric groups
+        time_metrics = {'approx_train_time_ms', 'step_avg_ms', 'training_time_ms', 'total_time_s'}
+        loss_metrics = {'train_loss', 'val_loss'}
+        optimization_metrics = {'lr', 'grad_norm', 'momentum'}
+        model_metrics = {'param_norm', 'spectral_norm_max', 'spectral_norm_mean', 'spectral_norm_std'}
+        hardware_metrics = {'peak_memory_mb', 'reserved_memory_mb'}
+        activation_metrics = set()  # For future activation stats
+        
+        for key, value in metrics.items():
+            # Determine which group this metric belongs to
+            if key in time_metrics:
+                grouped[f"Time/{key}"] = value
+            elif key in loss_metrics:
+                grouped[f"Loss/{key}"] = value
+            elif key in optimization_metrics:
+                grouped[f"Optimization/{key}"] = value
+            elif key in model_metrics:
+                grouped[f"Model/{key}"] = value
+            elif key in hardware_metrics:
+                grouped[f"Hardware/{key}"] = value
+            elif key.endswith(('_mean', '_std', '_max', '_min', '_l2_norm')) and any(layer in key for layer in ['layer', 'block', 'attention', 'mlp']):
+                grouped[f"Activations/{key}"] = value
+            elif key == 'step':
+                # Keep step at root level for x-axis
+                grouped[key] = value
+            else:
+                # Default group for unknown metrics
+                grouped[f"Other/{key}"] = value
+        
+        return grouped
     
     def save_config(self, config: Dict[str, Any]):
         """Save experiment configuration to file."""

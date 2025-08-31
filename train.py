@@ -53,7 +53,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.model import GPT, GPTConfig
 from core.mup import MuPConfig, set_base_shapes, apply_mup_to_model, MuReadout
 from core.optimizers import create_mup_muon_optimizer, step_optimizers, zero_grad_optimizers, apply_lr_schedule, apply_momentum_warmup
-from core.utils import SimpleLogger, Timer, compute_grad_norm, get_model_info, set_seed, print0
+from core.utils import SimpleLogger, Timer, compute_grad_norm, compute_param_norm, compute_weight_spectral_norms, get_model_info, set_seed, print0
 from core import mup  # For initialization functions
 
 
@@ -417,11 +417,18 @@ def train_model(config: TrainingConfig, args=None):
         
         # Training step
         inputs, targets = next(train_loader)
-        model(inputs, targets, get_window_size_blocks(step, config.num_iterations)).backward()
+        train_loss = model(inputs, targets, get_window_size_blocks(step, config.num_iterations))
+        train_loss.backward()
         
         # Update learning rates and momentum
         apply_lr_schedule(optimizers, step, config.num_iterations, config.cooldown_frac)
         apply_momentum_warmup(optimizers, step, warmup_steps=300)
+        
+        # Compute grad norm before optimizer step
+        grad_norm = compute_grad_norm(model) if step >= 0 else 0.0
+        
+        # Compute param norm (lightweight metric)
+        param_norm = compute_param_norm(model)
         
         # Optimizer step
         step_optimizers(optimizers)
@@ -430,14 +437,28 @@ def train_model(config: TrainingConfig, args=None):
         # Log training metrics
         if master_process and step % 10 == 0:
             approx_training_time_ms = training_time_ms + 1000 * timer.avg_time()
-            grad_norm = compute_grad_norm(model) if step > 0 else 0.0
             metrics = {
                 'step': step + 1,
                 'approx_train_time_ms': approx_training_time_ms,
                 'step_avg_ms': approx_training_time_ms / (step + 1),
                 'grad_norm': grad_norm,
-                'lr': optimizers[0].param_groups[0]['lr']
+                'param_norm': param_norm,
+                'lr': optimizers[0].param_groups[0]['lr'],
+                'train_loss': train_loss.item()
             }
+            
+            # Add expensive spectral norm metrics every 100 steps
+            if step % 100 == 0:
+                spectral_norms = compute_weight_spectral_norms(model)
+                if spectral_norms:  # Only add if we have weight matrices
+                    import numpy as np
+                    spectral_values = list(spectral_norms.values())
+                    metrics.update({
+                        'spectral_norm_max': max(spectral_values),
+                        'spectral_norm_mean': np.mean(spectral_values),
+                        'spectral_norm_std': np.std(spectral_values)
+                    })
+            
             logger.log(metrics)
             if step % 100 == 0:
                 print(f"step:{step+1}/{config.num_iterations} "
@@ -475,6 +496,10 @@ def main():
     parser.add_argument('--mup', action='store_true', help='Enable MuP scaling')
     parser.add_argument('--width', type=int, default=768, help='Model width')
     parser.add_argument('--base-width', type=int, default=768, help='Base model width for MuP')
+    
+    # Data options
+    parser.add_argument('--train-data', type=str, default="data/finewebedu10B/finewebedu_train_*.bin", help='Training data path pattern')
+    parser.add_argument('--val-data', type=str, default="data/finewebedu10B/finewebedu_val_*.bin", help='Validation data path pattern')
     
     # Training options
     parser.add_argument('--iterations', type=int, default=1750, help='Number of training iterations')
@@ -514,7 +539,9 @@ def main():
         base_width=args.base_width,
         num_iterations=args.iterations,
         seed=args.seed,
-        compile_model=args.compile
+        compile_model=args.compile,
+        train_files=args.train_data,
+        val_files=args.val_data
     )
     
     # Load config file if provided
