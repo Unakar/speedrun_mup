@@ -248,7 +248,8 @@ class SimpleLogger:
                 grouped[f"Model/{key}"] = value
             elif key in hardware_metrics:
                 grouped[f"Hardware/{key}"] = value
-            elif key.endswith(('_mean', '_std', '_max', '_min', '_l2_norm')) and any(layer in key for layer in ['layer', 'block', 'attention', 'mlp']):
+            elif key.endswith(('_mean', '_std', '_max', '_min', '_l2_norm')):
+                # All activation statistics end with these suffixes
                 grouped[f"Activations/{key}"] = value
             elif key == 'step':
                 # Keep step at root level for x-axis
@@ -334,20 +335,178 @@ def compute_param_norm(model: torch.nn.Module) -> float:
     return total_norm ** 0.5
 
 
-def compute_weight_spectral_norms(model: torch.nn.Module) -> Dict[str, float]:
-    """Compute spectral norms for weight matrices (2D parameters)."""
-    spectral_norms = {}
-    for name, param in model.named_parameters():
-        if param.dim() >= 2 and 'weight' in name:
-            # Compute spectral norm (largest singular value)
-            with torch.no_grad():
-                if param.dim() == 2:
-                    spectral_norm = torch.linalg.matrix_norm(param, ord=2).item()
+# ---------- Newton–Schulz building blocks (bf16-friendly, GPU matmul only) ----------
+
+@torch.no_grad()
+def _ns5_zeroth_power(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Quintic Newton–Schulz used in Muon to approx the orthogonal polar factor.
+    Uses the (a,b,c) tuned for large slope at 0 (non-convergent to 1 but fast).
+    Ref: Keller Jordan's Muon writeup & modded-nanogpt README.
+    """
+    assert G.ndim == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)  # Muon coefficients
+    # Normalize to keep singular values in [0,1]-ish
+    X = G.to(dtype=torch.bfloat16)
+    # Use Fro norm; for tall/flat handling we follow Muon trick (transpose to tall)
+    if X.size(0) > X.size(1):
+        X = X.mT
+        transposed = True
+    else:
+        transposed = False
+    X = X / (X.norm() + eps)
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * (A @ A)
+        X = a * X + B @ X
+    if transposed:
+        X = X.mT
+    return X  # keep bf16; caller may cast
+
+
+@torch.no_grad()
+def _ns3_polar(G: torch.Tensor, steps: int = 8, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Classic convergent Newton–Schulz for polar factor:
+      X_{k+1} = 0.5 * X_k * (3I - X_k^T X_k)
+    After pre-scaling. Slower but better accuracy for polar(Q).
+    """
+    assert G.ndim == 2
+    X = G.to(dtype=torch.bfloat16)
+    if X.size(0) > X.size(1):
+        X = X.mT
+        transposed = True
+    else:
+        transposed = False
+    X = X / (X.norm() + eps)
+    I = torch.eye(X.size(-1), device=X.device, dtype=X.dtype)
+    for _ in range(steps):
+        XtX = X.mT @ X
+        X = 0.5 * (X @ (3*I - XtX))
+    if transposed:
+        X = X.mT
+    return X
+
+
+@torch.no_grad()
+def _polar_factor(G: torch.Tensor, *, mode: str = "ns5-fast") -> torch.Tensor:
+    if mode == "ns5-fast":
+        return _ns5_zeroth_power(G, steps=5)
+    elif mode == "ns3-accurate":
+        return _ns3_polar(G, steps=8)
+    else:
+        raise ValueError(f"unknown mode={mode}")
+
+
+# ---------- Spectral norm via polar + power iteration on H ≈ (W^T W)^{1/2} ----------
+
+@torch.no_grad()
+def _spectral_norm_via_polar_power(W: torch.Tensor, *, mode: str, power_iters: int = 7) -> float:
+    """
+    Estimate sigma_max(W) using:
+      1) Q ≈ polar(W) by Newton–Schulz (bf16-friendly)
+      2) H = Q^T W ≈ (W^T W)^{1/2}; run power-iteration on linear op v -> Q^T (W v)
+    Memory-lean: never explicitly forms H.
+    """
+    device = W.device
+    # Flatten conv/ND to (out_features, in_features)
+    if W.ndim > 2:
+        W2 = W.reshape(W.size(0), -1)
+    else:
+        W2 = W
+
+    # Build Q in bf16 (GPU-friendly). Keep W matmuls in bf16 as well.
+    Q = _polar_factor(W2, mode=mode)  # bf16
+    n = W2.size(1)
+    # Power iteration on symmetric PSD linear operator H(v) = Q^T (W v)
+    # Work vectors in bf16 for matmul, but norms/inner-products in fp32
+    v = torch.randn(n, device=device, dtype=torch.bfloat16)
+    v = v / (v.float().norm() + 1e-12)
+
+    for _ in range(max(1, power_iters)):
+        y = W2.to(torch.bfloat16) @ v              # shape (m,)
+        z = Q.mT @ y                               # shape (n,) == H @ v
+        v = z / (z.float().norm() + 1e-12)
+
+    # Rayleigh quotient on the last (v, Hv)
+    y = W2.to(torch.bfloat16) @ v
+    Hv = Q.mT @ y
+    num = (v.float() * Hv.float()).sum()
+    den = (v.float() * v.float()).sum()
+    lam = (num / (den + 1e-20)).item()            # eigenvalue of H
+    # H ≈ (W^T W)^{1/2} => eigenvalues of H are singular values of W
+    sigma = max(lam, 0.0)
+    return float(sigma)
+
+
+# ---------- Public API ----------
+
+def compute_weight_spectral_norms(
+    model: torch.nn.Module, 
+    target_params: list = None,
+    mode: str = "ns5-fast",          # or "ns3-accurate"
+    power_iters: int = 7
+) -> Dict[str, float]:
+    """
+    Compute per-weight spectral norms during bf16/fp16 mixed-precision training
+    using efficient Newton-Schulz polar decomposition + power iteration.
+    
+    This method is bf16-friendly and compatible with Muon optimizer's approach.
+    Heavy ops done in bf16; reductions in fp32.
+
+    Args:
+        model: The model to analyze
+        target_params: If provided, only compute spectral norms for parameters in this list
+        mode: "ns5-fast" (Muon-style, fast but slight bias) or "ns3-accurate" (slower, more accurate)
+        power_iters: Number of power iteration steps
+
+    Returns:
+        {parameter_name: approx_sigma_max}
+    """
+    import contextlib
+    
+    spectral_norms: Dict[str, float] = {}
+    
+    # If target_params provided, create a set of parameter objects for fast lookup
+    target_param_set = set(target_params) if target_params else None
+
+    # ensure we don't get autocast surprises from the training region
+    maybe_no_autocast = (
+        torch.amp.autocast(device_type='cuda', enabled=False)
+        if torch.cuda.is_available() else contextlib.nullcontext()
+    )
+    
+    with maybe_no_autocast:
+        for name, param in model.named_parameters():
+            # Skip if target_params specified and this param is not in the list
+            if target_param_set and param not in target_param_set:
+                continue
+            if param.ndim < 2 or 'weight' not in name:
+                continue
+                
+            W = param.detach()  # never touches autograd graph
+            try:
+                sigma = _spectral_norm_via_polar_power(W, mode=mode, power_iters=power_iters)
+            except Exception:
+                # Robust fallback: plain power iteration on W^T W (still bf16 matmuls)
+                # This matches PyTorch spectral_norm's math, but stays off matrix_norm().
+                if W.ndim > 2:
+                    W2 = W.reshape(W.size(0), -1)
                 else:
-                    # For higher-dim tensors, flatten to 2D
-                    param_2d = param.view(param.size(0), -1)
-                    spectral_norm = torch.linalg.matrix_norm(param_2d, ord=2).item()
-                spectral_norms[name] = spectral_norm
+                    W2 = W
+                m, n = W2.shape
+                v = torch.randn(n, device=W2.device, dtype=torch.bfloat16)
+                v = v / (v.float().norm() + 1e-12)
+                for _ in range(max(3, power_iters)):
+                    z = W2.mT @ (W2.to(torch.bfloat16) @ v)  # (n,)
+                    v = z / (z.float().norm() + 1e-12)
+                # Rayleigh: v^T (W^T W) v
+                z = W2.mT @ (W2.to(torch.bfloat16) @ v)
+                num = (v.float() * z.float()).sum()
+                den = (v.float() * v.float()).sum()
+                sigma = float(torch.sqrt((num / (den + 1e-20)).clamp_min(0)).item())
+            spectral_norms[name] = sigma
+    
     return spectral_norms
 
 

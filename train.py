@@ -53,7 +53,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.model import GPT, GPTConfig
 from core.mup import MuPConfig, set_base_shapes, apply_mup_to_model, MuReadout
 from core.optimizers import create_mup_muon_optimizer, step_optimizers, zero_grad_optimizers, apply_lr_schedule, apply_momentum_warmup
-from core.utils import SimpleLogger, Timer, compute_grad_norm, compute_param_norm, compute_weight_spectral_norms, get_model_info, set_seed, print0
+from core.utils import SimpleLogger, Timer, compute_grad_norm, compute_param_norm, compute_weight_spectral_norms, ActivationHook, get_model_info, set_seed, print0
 from core import mup  # For initialization functions
 
 
@@ -71,7 +71,7 @@ class TrainingConfig:
     val_seq_len: int = 4 * 64 * 1024
     
     # Model
-    vocab_size: int = 50304
+    vocab_size: int = 50257  # Standard GPT-2 vocabulary size (adjusted to 50304 internally)
     num_layers: int = 12
     num_heads: int = 6
     model_dim: int = 768
@@ -95,6 +95,11 @@ class TrainingConfig:
     warmup_steps: int = 10
     device: str = "cuda"
     seed: int = 42
+    
+    # Advanced monitoring
+    monitor_spectral_every: int = 0  # 0 = disabled, N = monitor every N steps
+    monitor_activations: bool = False
+    monitor_activations_every: int = 100
 
 
 # -----------------------------------------------------------------------------
@@ -305,6 +310,14 @@ def train_model(config: TrainingConfig, args=None):
         if config.use_mup:
             print(f"MuP enabled: base_width={config.base_width}, target_width={config.target_width}")
     
+    # Initialize activation monitoring if enabled
+    activation_monitor = None
+    if config.monitor_activations:
+        activation_monitor = ActivationHook()
+        activation_monitor.register_hooks(model)
+        if master_process:
+            print(f"Enabled activation monitoring every {config.monitor_activations_every} steps")
+    
     # Collect parameters for optimization
     hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
     embed_params = [p for n, p in model.named_parameters() if "embed" in n]
@@ -447,9 +460,11 @@ def train_model(config: TrainingConfig, args=None):
                 'train_loss': train_loss.item()
             }
             
-            # Add expensive spectral norm metrics every 100 steps
-            if step % 100 == 0:
-                spectral_norms = compute_weight_spectral_norms(model)
+            # Add expensive spectral norm metrics if configured
+            if (config.monitor_spectral_every > 0 and 
+                step % config.monitor_spectral_every == 0):
+                # Only monitor spectral norms for hidden matrix parameters (optimized by muon)
+                spectral_norms = compute_weight_spectral_norms(model, hidden_matrix_params)
                 if spectral_norms:  # Only add if we have weight matrices
                     import numpy as np
                     spectral_values = list(spectral_norms.values())
@@ -458,6 +473,14 @@ def train_model(config: TrainingConfig, args=None):
                         'spectral_norm_mean': np.mean(spectral_values),
                         'spectral_norm_std': np.std(spectral_values)
                     })
+            
+            # Add activation statistics if configured
+            if (activation_monitor is not None and 
+                config.monitor_activations_every > 0 and
+                step % config.monitor_activations_every == 0):
+                activation_stats = activation_monitor.get_stats()
+                metrics.update(activation_stats)
+                activation_monitor.clear()  # Clear for next collection
             
             logger.log(metrics)
             if step % 100 == 0:
@@ -480,6 +503,10 @@ def train_model(config: TrainingConfig, args=None):
         logger.log(final_metrics)
         print(f"peak memory allocated: {peak_mem} MiB reserved: {reserved_mem} MiB")
         logger.close()
+    
+    # Clean up activation monitoring
+    if activation_monitor is not None:
+        activation_monitor.remove_hooks()
     
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -525,6 +552,11 @@ def main():
     parser.add_argument('--wandb-project', type=str, help='W&B project name')
     parser.add_argument('--wandb-name', type=str, help='W&B run name')
     
+    # Advanced monitoring
+    parser.add_argument('--monitor-spectral-every', type=int, default=0, help='Monitor spectral norms every N steps (0=disabled)')
+    parser.add_argument('--monitor-activations', action='store_true', help='Enable activation statistics monitoring')
+    parser.add_argument('--monitor-activations-every', type=int, default=100, help='Monitor activations every N steps')
+    
     # System options
     parser.add_argument('--compile', type=lambda x: x.lower() == 'true', default=True, help='Compile model')
     parser.add_argument('--seed', type=int, default=1337, help='Random seed')
@@ -541,7 +573,10 @@ def main():
         seed=args.seed,
         compile_model=args.compile,
         train_files=args.train_data,
-        val_files=args.val_data
+        val_files=args.val_data,
+        monitor_spectral_every=args.monitor_spectral_every,
+        monitor_activations=args.monitor_activations,
+        monitor_activations_every=args.monitor_activations_every
     )
     
     # Load config file if provided

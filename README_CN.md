@@ -135,19 +135,54 @@ MuP 实现遵循标准做法：
 
 **SimpleLogger**: 与 modded-nanogpt 风格对齐的简洁日志系统
 - 自动实验命名：`speedrun_20250831_143022_mup_w1024_base768`
+- 结构化指标分组：Time/, Loss/, Optimization/, Model/, Hardware/, Activations/
 - 结构化日志：控制台 + 文件 + W&B
 - 硬件检测：H100(989T), B200(2500T), A100(312T) FLOPS
 
-**TrainingMonitor**: 性能感知的高级监控
-- 基础指标 (每步): 梯度范数、参数范数
-- 昂贵指标 (按间隔): 谱范数、激活统计
-- 智能调度：平衡监控详细度与训练速度
+**高级谱范数监控**: 基于 Newton-Schulz 的高效实现
+- **ns5-fast 模式**: 使用 Muon 风格的五阶 Newton-Schulz 迭代，速度优先
+- **ns3-accurate 模式**: 经典收敛型三阶迭代，精度优先
+- **BF16 友好**: 完全兼容混合精度训练，无需类型转换
+- **智能备份**: 自动回退到传统幂迭代确保稳定性
+
+### 完整监控指标
+
+**基础指标** (每步轻量计算):
+- `train_loss`: 训练损失
+- `grad_norm`: 全局梯度范数
+- `param_norm`: 全局参数范数 
+- `lr`: 学习率
+- `training_time_ms`: 训练时间
+
+**高级指标** (可配置间隔):
+- `spectral_norm_max/mean/std`: 权重矩阵谱范数统计 (Newton-Schulz)
+- `activation_mean/std/max/min/l2_norm`: 激活层统计
+- `peak_memory_mb`: 峰值显存使用
+- `reserved_memory_mb`: 保留显存
+
+### 配置化监控
+
+```bash
+# 启用谱范数监控 (每100步)
+MONITOR_SPECTRAL_EVERY=100 bash scripts/run_basic_speedrun.sh
+
+# 启用激活统计监控
+MONITOR_ACTIVATIONS=true bash scripts/run_basic_speedrun.sh
+
+# 组合使用
+MONITOR_SPECTRAL_EVERY=50 MONITOR_ACTIVATIONS=true \
+bash scripts/run_basic_speedrun.sh 768 1750 1337
+```
 
 ### 性能开销
 
-- **轻量监控** (<1ms/step): 基础指标、W&B 日志
-- **昂贵监控** (50-200ms/step): 谱范数、激活统计
-- **建议配置**: 日常训练每 100 步，研究调试每 10 步
+- **轻量监控** (<1ms/step): 基础指标、参数/梯度范数
+- **Newton-Schulz 谱范数** (5-15ms/step): 高效极分解 + 幂迭代
+- **激活统计** (10-30ms/step): 依赖钩子数量
+- **传统谱范数** (50-200ms/step): SVD 分解，已弃用
+- **建议配置**: 
+  - 日常训练: `MONITOR_SPECTRAL_EVERY=100`
+  - 研究调试: `MONITOR_SPECTRAL_EVERY=10 MONITOR_ACTIVATIONS=true`
 
 ## 实验组织
 

@@ -18,6 +18,9 @@
 #   USE_WANDB=true          # Enable W&B logging
 #   WANDB_PROJECT="speedrun-basic"  # W&B project name
 #   WANDB_NAME=""           # W&B run name (optional)
+#   MONITOR_SPECTRAL_EVERY=0  # Monitor spectral norms every N steps (0=disabled)
+#   MONITOR_ACTIVATIONS=false # Enable activation statistics monitoring
+#   MONITOR_ACTIVATIONS_EVERY=100  # Monitor activations every N steps
 #   COMPILE=true            # Enable model compilation
 #   MUP=false               # Enable MuP scaling
 #   BASE_WIDTH=768          # MuP base width
@@ -26,6 +29,7 @@
 #   bash run_basic_speedrun.sh 768 1750 1337
 #   LEARNING_RATE=1e-4 bash run_basic_speedrun.sh 1024 2000 42
 #   MUP=true BASE_WIDTH=512 bash run_basic_speedrun.sh 1024 1750 1337
+#   MONITOR_SPECTRAL_EVERY=100 bash run_basic_speedrun.sh 768 1750 1337  # Enable spectral monitoring
 
 set -e
 
@@ -51,6 +55,11 @@ LOG_EVERY=${LOG_EVERY:-10}
 USE_WANDB=${USE_WANDB:-true}
 WANDB_PROJECT=${WANDB_PROJECT:-"speedrun-basic"}
 WANDB_NAME=${WANDB_NAME:-""}
+
+# Advanced monitoring (expensive metrics)
+MONITOR_SPECTRAL_EVERY=${MONITOR_SPECTRAL_EVERY:-100}  # 0=disabled, 100=every 100 steps
+MONITOR_ACTIVATIONS=${MONITOR_ACTIVATIONS:-false}
+MONITOR_ACTIVATIONS_EVERY=${MONITOR_ACTIVATIONS_EVERY:-100}
 
 # System options
 COMPILE=${COMPILE:-true}
@@ -112,8 +121,15 @@ TRAIN_CMD=(
     --log-every $LOG_EVERY
     --use-wandb $USE_WANDB
     --wandb-project "$WANDB_PROJECT"
+    --monitor-spectral-every $MONITOR_SPECTRAL_EVERY
+    --monitor-activations-every $MONITOR_ACTIVATIONS_EVERY
     --compile $COMPILE
 )
+
+# Add activation monitoring if enabled
+if [ "$MONITOR_ACTIVATIONS" = "true" ]; then
+    TRAIN_CMD+=(--monitor-activations)
+fi
 
 # Add MuP parameters if enabled
 if [ "$MUP" = "true" ]; then

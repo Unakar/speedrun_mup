@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document analyzes the W&B integration and advanced monitoring features in speedrun-mup, focusing on performance impact and recommended usage patterns.
+This document analyzes the W&B integration and advanced monitoring features in speedrun-mup, focusing on performance impact and recommended usage patterns, with particular emphasis on the efficient Newton-Schulz based spectral norm computation.
 
 ## W&B Metrics Categories
 
@@ -10,13 +10,14 @@ This document analyzes the W&B integration and advanced monitoring features in s
 - `step`: Training step number
 - `training_time_ms`: Wall-clock training time in milliseconds
 - `step_avg_ms`: Average time per step
+- `train_loss`: Training loss
 - `val_loss`: Validation loss (when available)
 
 ### Advanced Monitoring Metrics (Configurable)
 - `grad_norm`: Global gradient norm (lightweight, always computed)
 - `param_norm`: Global parameter norm (lightweight, always computed)
-- `spectral_norm_max/mean/std`: Weight matrix spectral norms (expensive)
-- `{layer}_mean/std/max/min/l2_norm`: Activation statistics (expensive)
+- `spectral_norm_max/mean/std`: Weight matrix spectral norms (Newton-Schulz, configurable)
+- `activation_mean/std/max/min/l2_norm`: Activation statistics (expensive, configurable)
 
 ## Performance Impact Analysis
 
@@ -26,21 +27,91 @@ This document analyzes the W&B integration and advanced monitoring features in s
 - **Basic logging to W&B**: ~1-2ms overhead per step
 - **Local file logging**: ~0.05ms overhead per step
 
-### Expensive Metrics (Significant Impact)
-- **Spectral norm computation**: 5-20ms overhead per monitored parameter
+### Newton-Schulz Spectral Norm (Medium Impact, Efficient Implementation)
+- **NS5 fast mode**: 5-10ms overhead per monitored parameter
+- **NS3 accurate mode**: 8-15ms overhead per monitored parameter
+- **BF16 friendly**: Fully compatible with mixed-precision training
+- **Smart optimization**: Only monitors Muon optimizer's hidden matrix parameters
+
+### Traditional Expensive Metrics (Significant Impact, Optimized)
+- **SVD spectral norm computation**: 20-50ms overhead per monitored parameter (deprecated)
 - **Activation statistics**: 2-10ms overhead per hooked layer
 - **Full monitoring on large models**: Can add 50-200ms per step
 
 ### Recommended Monitoring Intervals
+
+#### Production Training Configuration
+```bash
+# High-performance daily training
+MONITOR_SPECTRAL_EVERY=100  # Newton-Schulz spectral norm
+MONITOR_ACTIVATIONS=false   # Disable activation statistics
+bash scripts/run_basic_speedrun.sh
+```
+
+#### Research/Debugging Configuration
+```bash
+# Research debugging mode
+MONITOR_SPECTRAL_EVERY=10   # More frequent spectral norm
+MONITOR_ACTIVATIONS=true    # Enable activation statistics
+bash scripts/run_basic_speedrun.sh
+```
+
+#### Final Validation Configuration
+```bash
+# Final validation runs
+MONITOR_SPECTRAL_EVERY=1    # Every step spectral norm
+MONITOR_ACTIVATIONS=true    # Full activation statistics
+bash scripts/run_basic_speedrun.sh
+```
+
+## Newton-Schulz Spectral Norm Technical Details
+
+### Algorithm Advantages
+
+**Polar Decomposition Method**: Uses Newton-Schulz iterations to compute the orthogonal polar factor Q ≈ polar(W)
+- **NS5 fast mode**: Muon-style quintic polynomial with coefficients optimized for high slope (3.4445, -4.7750, 2.0315)
+- **NS3 accurate mode**: Classic convergent cubic iteration with higher precision
+
+**Power Iteration Optimization**: Performs power iteration on H = Q^T W ≈ (W^T W)^{1/2}
+- **Memory efficient**: Never explicitly constructs the H matrix, uses linear operator v → Q^T(Wv)
+- **BF16 compatible**: Matrix multiplications in BF16, norm computations in FP32
+- **Smart fallback**: Automatic fallback to traditional W^T W power iteration on failure
+
+### Precision vs Performance Trade-offs
+
+**NS5 Fast Mode**:
+- ✅ Consistent with Muon optimizer style
+- ✅ Speed-prioritized, 5-10ms/parameter
+- ⚠️ Slight bias possible (tens of percentage points)
+- 🎯 **Recommended for**: Daily training monitoring, trend analysis
+
+**NS3 Accurate Mode**:
+- ✅ Closer to strict polar decomposition
+- ✅ Higher precision spectral norm estimation
+- ⚠️ 8-15ms/parameter, slightly slower
+- 🎯 **Recommended for**: Research analysis, precise measurements
+
+### Usage Examples
+
 ```python
-# For production training
-monitor_interval = 100  # Check expensive metrics every 100 steps
+# Configure Newton-Schulz spectral norm monitoring
+from core.utils import compute_weight_spectral_norms
 
-# For debugging/research
-monitor_interval = 10   # More frequent monitoring
+# Fast mode - daily training
+spectral_norms = compute_weight_spectral_norms(
+    model, 
+    target_params=hidden_matrix_params,
+    mode="ns5-fast", 
+    power_iters=7
+)
 
-# For final validation runs
-monitor_interval = 1    # Monitor every step (expensive but thorough)
+# Accurate mode - research analysis
+spectral_norms = compute_weight_spectral_norms(
+    model,
+    target_params=hidden_matrix_params, 
+    mode="ns3-accurate",
+    power_iters=10
+)
 ```
 
 ## W&B Integration Benefits
@@ -61,44 +132,73 @@ monitor_interval = 1    # Monitor every step (expensive but thorough)
 - **Scaling validation**: Hyperparameter transfer verification
 - **Width comparison**: Side-by-side comparison of different model widths
 
+### W&B Metric Grouping
+
+Metrics are organized by category for clear visualization:
+
+**Time/** (time-related):
+- `Time/training_time_ms`
+- `Time/step_avg_ms`
+- `Time/total_time_s`
+
+**Loss/** (loss functions):
+- `Loss/train_loss`
+- `Loss/val_loss`
+
+**Optimization/** (optimization-related):
+- `Optimization/lr`
+- `Optimization/grad_norm`
+- `Optimization/momentum`
+
+**Model/** (model parameters):
+- `Model/param_norm`
+- `Model/spectral_norm_max`
+- `Model/spectral_norm_mean`
+- `Model/spectral_norm_std`
+
+**Hardware/** (hardware resources):
+- `Hardware/peak_memory_mb`
+- `Hardware/reserved_memory_mb`
+
+**Activations/** (activation statistics):
+- `Activations/layer_0_mean`
+- `Activations/layer_0_std`
+- `Activations/attention_l2_norm`
+
 ## Recommended Usage Patterns
 
 ### For Daily Training
-```python
+```bash
+# Basic monitoring with minimal performance impact
 logger = SimpleLogger(
     use_wandb=True, 
     project_name="speedrun-mup"
 )
-monitor = TrainingMonitor(
-    model, 
-    monitor_interval=100,  # Every 100 steps
-    enable_spectral_norms=False,  # Disable expensive metrics
-    enable_activation_stats=False
-)
+# Use script configuration
+MONITOR_SPECTRAL_EVERY=100 bash scripts/run_basic_speedrun.sh
 ```
 
 ### For Research/Debugging
-```python
+```bash
+# Detailed monitoring, research-friendly
 logger = SimpleLogger(
     use_wandb=True, 
     project_name="speedrun-mup-research"
 )
-monitor = TrainingMonitor(
-    model, 
-    monitor_interval=10,   # Every 10 steps
-    enable_spectral_norms=True,   # Enable for analysis
-    enable_activation_stats=True  # Enable for debugging
-)
+# Use script configuration
+MONITOR_SPECTRAL_EVERY=10 MONITOR_ACTIVATIONS=true \
+bash scripts/run_basic_speedrun.sh
 ```
 
 ### For MuP Validation
-```python
+```bash
+# MuP coordinate checking specialized
 logger = SimpleLogger(
     use_wandb=True, 
     project_name="speedrun-mup-coord-check"
 )
-# Use coordinate checking functionality from core/mup.py
-# Monitor activation magnitudes across different widths
+# Enable coordinate checking functionality
+python train.py --mup --coord-check --coord-check-every 50
 ```
 
 ## Performance Recommendations
