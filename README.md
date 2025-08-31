@@ -1,121 +1,122 @@
-# Speedrun-MuP 🚀
+# Speedrun-MuP
 
-A clean experimental stack for **Maximal Update Parameterization (μP)** scaling experiments built on top of the modded-nanogpt "speedrun" architecture.
+A research implementation of Maximal Update Parameterization (MuP) integrated with the modded-nanogpt speedrun architecture for efficient transformer scaling experiments.
 
 ## Overview
 
-Speedrun-MuP combines the world-record training speed of modded-nanogpt with the principled scaling laws of μP to enable:
+This project combines the state-of-the-art training optimizations from modded-nanogpt with principled scaling laws from MuP theory. It enables zero-shot hyperparameter transfer across model widths while maintaining competitive training performance.
 
-- **Width-invariant hyperparameters** that transfer across model scales
-- **Competitive training speed** with modern optimizations (FlexAttention, FP8, Muon optimizer)
-- **Comprehensive validation** through coordinate checking and spectral monitoring
-- **Research-ready metrics** with automatic plotting and W&B integration
-
-  speedrun_mup/
-  ├── core/                    # Clean, concise implementation
-  │   ├── __init__.py         # Simple package initialization
-  │   ├── model.py            # GPT implementation following modded-nanogpt
-  │   ├── mup.py              # MuP scaling and coordinate checking
-  │   └── utils.py            # Consolidated logging and utilities
-  ├── scripts/                # Executable training scripts
-  │   ├── train.py           # Main training script with MuP
-  │   └── coord_check.py     # Coordinate validation
-  ├── configs/                # Simplified YAML configurations
-  │   ├── gpt_small_mup.yaml # Basic GPT-small config
-  │   └── width_sweep.yaml   # Width experiments config
-  ├── claude_instructions/    # Preserved unchanged
-  └── origin_repos/          # Preserved unchanged
-      ├── modded-nanogpt/
-      └── mup/
-
-## Quick Start
-
-### 1. Coordinate Checking
-
-First, validate your MuP implementation:
-
-```bash
-python scripts/coord_check.py \
-    --mup-config configs/mup/width_sweep.yaml \
-    --widths 256 512 1024 \
-    --output-dir ./coord_check_results
-```
-
-This will:
-- Test models at different widths
-- Generate coordinate check plots
-- Validate that activations remain O(1) across widths
-
-### 2. Basic Training
-
-Run a basic MuP training experiment:
-
-```bash
-python scripts/train.py \
-    --config configs/base/gpt_small.yaml \
-    --mup-config configs/mup/width_sweep.yaml \
-    --run-name my_mup_experiment
-```
-
-### 3. Width Scaling Experiment
-
-Test hyperparameter transfer across multiple widths:
-
-```bash
-# Train base model
-python scripts/train.py \
-    --config configs/base/gpt_small.yaml \
-    --mup-config configs/mup/width_sweep.yaml \
-    --run-name base_width_256
-
-# Transfer to larger widths (automatically uses MuP scaling)
-python scripts/train.py \
-    --config configs/base/gpt_medium.yaml \
-    --mup-config configs/mup/width_sweep.yaml \
-    --run-name transferred_width_768
-```
+**Key Features:**
+- Full modded-nanogpt architecture implementation (FlexAttention, FP8, U-net skip connections, value embeddings, Muon optimizer)
+- Standard MuP implementation with InfShape dimension tracking and coordinate checking
+- Distributed training support for 8xH100 systems
+- Comprehensive validation tools and experiment tracking
 
 ## Project Structure
 
 ```
 speedrun_mup/
-├── speedrun_mup/           # Core package
-│   ├── models/            # MuP-aware model implementations
-│   ├── training/          # Training loops and optimizers
-│   ├── config/            # Configuration management
-│   ├── logging/           # Metrics and W&B integration
-│   ├── validation/        # Coordinate checking and validation
-│   └── utils/             # MuP utilities and shape management
-├── configs/               # Experiment configurations
-│   ├── base/             # Base model configurations
-│   ├── mup/              # MuP-specific configurations
-│   └── experiments/      # Full experiment suites
-├── scripts/              # Entry point scripts
-│   ├── train.py         # Main training script
-│   ├── coord_check.py   # Coordinate checking
-│   └── analyze_run.py   # Post-training analysis
-└── analysis/             # Notebooks and plotting utilities
+├── core/                    # Core implementation modules
+│   ├── model.py            # GPT architecture (exact modded-nanogpt replica)
+│   ├── mup.py              # MuP scaling and dimension tracking
+│   ├── optimizers.py       # Muon and DistAdam optimizers
+│   └── utils.py            # Logging, metrics, and utilities
+├── scripts/                # Training and experiment scripts
+│   └── train.py           # Main training script with MuP support
+├── configs/                # Experiment configurations
+│   └── width_sweep.yaml   # MuP scaling experiment template
+├── claude_instructions/    # Project background documentation
+└── origin_repos/          # Reference implementations
+    ├── modded-nanogpt/
+    └── mup/
 ```
 
+## Usage
 
-## Troubleshooting
+### Basic Training
 
-### Coordinate Checks Fail
+Train a GPT model with standard hyperparameters:
+
 ```bash
-# Common issues:
-# 1. Incorrect base shapes - regenerate with fresh models
-# 2. Architecture incompatibility - check skip connections
-# 3. Initialization problems - verify MuP init is applied
-
-# Debug with:
-python scripts/coord_check.py --widths 256 512 --n-steps 5
+python scripts/train.py --width 768 --iterations 1750
 ```
 
-## Recommand links (kexue.fm is all you need)
+### MuP Scaling Experiments
+
+Train with MuP for zero-shot hyperparameter transfer:
+
+```bash
+# Base model (width 768)
+python scripts/train.py --mup --width 768 --base-width 768 --iterations 1750
+
+# Larger model with transferred hyperparameters
+python scripts/train.py --mup --width 1024 --base-width 768 --iterations 1750
+```
+
+### Distributed Training
+
+For multi-GPU systems:
+
+```bash
+torchrun --nproc_per_node=8 scripts/train.py --mup --width 1024 --base-width 768
+```
+
+### Configuration Options
+
+The training script supports extensive configuration:
+
+```bash
+python scripts/train.py \
+    --mup                        # Enable MuP scaling
+    --width 1024                 # Target model width
+    --base-width 768             # Base width for MuP reference
+    --iterations 1750            # Training steps
+    --seed 42                    # Random seed
+    --no-compile                 # Disable torch.compile
+```
+
+## Implementation Details
+
+### Architecture Fidelity
+
+The model implementation maintains exact compatibility with modded-nanogpt:
+- Custom FP8 operators (`nanogpt::mm`)
+- FlexAttention with sliding window block masks
+- U-net skip connections with learned scalar weights
+- Value embeddings with 012...012 pattern
+- Half-truncated RoPE with base frequency tuning
+- ReLU² activation and logit soft-capping
+
+### MuP Integration
+
+The MuP implementation follows standard practices:
+- InfShape dimension tracking for all parameters
+- MuP-aware initialization and optimizers
+- Output layer scaling and coordinate checking
+- Support for width scaling experiments
+
+### Performance Optimizations
+
+Training includes all modded-nanogpt optimizations:
+- Kernel warmup and torch.compile
+- Distributed data loading with document alignment  
+- Learning rate scheduling with momentum warmup
+- Memory-efficient gradient accumulation
+
+## Validation
+
+The implementation includes coordinate checking functionality to validate MuP correctness. Proper MuP implementations should show stable activation magnitudes across different model widths.
+
+## Requirements
+
+- PyTorch 2.5+ with CUDA support
+- FlexAttention support (requires recent PyTorch nightly for some features)
+- Distributed training: NCCL backend for multi-GPU setups
+- Optional: wandb for experiment tracking
+
+## References
 
 - [Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer](https://arxiv.org/abs/2203.03466)
-- [μP Practitioner's Guide](https://www.cerebras.ai/blog/the-practitioners-guide-to-the-maximal-update-parameterization)
 - [Modded-NanoGPT Repository](https://github.com/KellerJordan/modded-nanogpt)
-- [Higher-order μP Spectral Conditions](https://kexue.fm/archives/10795)
-
----
+- [MuP Repository](https://github.com/microsoft/mup)
+- [μP Theory and Practice (kexue.fm)](https://kexue.fm/archives/10795)
