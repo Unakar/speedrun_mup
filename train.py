@@ -259,7 +259,7 @@ def create_model(config: TrainingConfig) -> nn.Module:
 # -----------------------------------------------------------------------------
 # Main training function
 
-def train_model(config: TrainingConfig):
+def train_model(config: TrainingConfig, args=None):
     """Main training function."""
     # Initialize distributed training
     rank = int(os.environ.get("RANK", "0"))
@@ -284,7 +284,15 @@ def train_model(config: TrainingConfig):
         os.makedirs("logs", exist_ok=True)
         logfile = f"logs/{run_id}.txt"
         print(f"Logging to: {logfile}")
-        logger = MetricsLogger(f"speedrun-mup", log_dir=f"logs/{run_id}")
+        if args:
+            logger = SimpleLogger(
+                use_wandb=args.use_wandb, 
+                project_name=args.wandb_project or "speedrun-mup",
+                experiment_name=args.wandb_name,
+                config=vars(args)
+            )
+        else:
+            logger = SimpleLogger(use_wandb=False)
     
     # Create model
     print(f"Creating model with width {config.model_dim}...")
@@ -461,13 +469,39 @@ def train_model(config: TrainingConfig):
 def main():
     parser = argparse.ArgumentParser(description='Train GPT model with MuP support')
     parser.add_argument('--config', type=str, help='Path to config file')
+    
+    # MuP options
     parser.add_argument('--mup', action='store_true', help='Enable MuP scaling')
     parser.add_argument('--width', type=int, default=768, help='Model width')
     parser.add_argument('--base-width', type=int, default=768, help='Base model width for MuP')
+    
+    # Training options
     parser.add_argument('--iterations', type=int, default=1750, help='Number of training iterations')
-    parser.add_argument('--lr', type=float, default=0.05, help='Base learning rate')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--no-compile', action='store_true', help='Disable model compilation')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size per GPU')
+    parser.add_argument('--sequence-length', type=int, default=1024, help='Sequence length')
+    parser.add_argument('--learning-rate', '--lr', type=float, default=3e-4, help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=0.1, help='Weight decay')
+    parser.add_argument('--grad-clip', type=float, default=1.0, help='Gradient clipping')
+    parser.add_argument('--warmup-steps', type=int, default=100, help='Warmup steps')
+    
+    # Validation and logging
+    parser.add_argument('--val-every', type=int, default=100, help='Validation interval')
+    parser.add_argument('--save-every', type=int, default=500, help='Save checkpoint interval')
+    parser.add_argument('--log-every', type=int, default=10, help='Logging interval')
+    parser.add_argument('--log-dir', type=str, help='Log directory')
+    
+    # Coordinate checking
+    parser.add_argument('--coord-check', action='store_true', help='Enable coordinate checking')
+    parser.add_argument('--coord-check-every', type=int, default=100, help='Coordinate check interval')
+    
+    # W&B logging
+    parser.add_argument('--use-wandb', type=lambda x: x.lower() == 'true', default=False, help='Use Weights & Biases')
+    parser.add_argument('--wandb-project', type=str, help='W&B project name')
+    parser.add_argument('--wandb-name', type=str, help='W&B run name')
+    
+    # System options
+    parser.add_argument('--compile', type=lambda x: x.lower() == 'true', default=True, help='Compile model')
+    parser.add_argument('--seed', type=int, default=1337, help='Random seed')
     
     args = parser.parse_args()
     
@@ -496,7 +530,7 @@ def main():
     for key, value in config.__dict__.items():
         print(f"  {key}: {value}")
     
-    train_model(config)
+    train_model(config, args)
 
 
 if __name__ == "__main__":
