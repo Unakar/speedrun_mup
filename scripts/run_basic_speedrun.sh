@@ -10,7 +10,7 @@ ITERATIONS=${2:-1750}
 SEED=${3:-1337}
 
 echo "=========================================="
-echo "Basic Speedrun Training (8xH100)"
+echo "Basic Speedrun Training"
 echo "Width: $WIDTH | Iterations: $ITERATIONS | Seed: $SEED"
 echo "=========================================="
 

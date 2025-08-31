@@ -246,6 +246,8 @@ class Timer:
     
     def __init__(self):
         self.start_time = None
+        self.total_time = 0.0
+        self.step_count = 0
     
     def start(self):
         """Start timing with CUDA sync."""
@@ -259,6 +261,8 @@ class Timer:
         
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - self.start_time
+        self.total_time += elapsed
+        self.step_count += 1
         self.start_time = None
         return elapsed
     
@@ -267,6 +271,12 @@ class Timer:
         if self.start_time is None:
             return 0.0
         return 1000 * (time.perf_counter() - self.start_time)
+    
+    def avg_time(self) -> float:
+        """Get average time per step in seconds."""
+        if self.step_count == 0:
+            return 0.0
+        return self.total_time / self.step_count
 
 
 def compute_grad_norm(model: torch.nn.Module) -> float:
