@@ -64,8 +64,8 @@ from core import mup  # For initialization functions
 class TrainingConfig:
     """Training configuration matching modded-nanogpt."""
     # Data
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin"
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin"
+    train_files: str = "data/finewebedu10B/finewebedu_train_*.bin"
+    val_files: str = "data/finewebedu10B/finewebedu_val_*.bin"
     val_tokens: int = 10485760
     train_seq_len: int = 48 * 1024
     val_seq_len: int = 4 * 64 * 1024
