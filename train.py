@@ -53,7 +53,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.model import GPT, GPTConfig
 from core.mup import MuPConfig, set_base_shapes, apply_mup_to_model, MuReadout
 from core.optimizers import create_mup_muon_optimizer, step_optimizers, zero_grad_optimizers, apply_lr_schedule, apply_momentum_warmup
-from core.utils import SimpleLogger, Timer, compute_grad_norm, get_model_info, set_seed
+from core.utils import SimpleLogger, Timer, compute_grad_norm, get_model_info, set_seed, print0
 from core import mup  # For initialization functions
 
 
@@ -295,7 +295,8 @@ def train_model(config: TrainingConfig, args=None):
             logger = SimpleLogger(use_wandb=False)
     
     # Create model
-    print(f"Creating model with width {config.model_dim}...")
+    if master_process:
+        print(f"Creating model with width {config.model_dim}...")
     model = create_model(config)
     
     if master_process:
@@ -335,7 +336,8 @@ def train_model(config: TrainingConfig, args=None):
         model = torch.compile(model, dynamic=False)
     
     # Kernel warmup
-    print("Warming up kernels...")
+    if master_process:
+        print("Warming up kernels...")
     initial_state = dict(model=copy.deepcopy(model.state_dict()),
                         optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers])
     train_loader = distributed_data_generator(config.train_files, world_size * config.train_seq_len, align_to_bos=True)
@@ -352,7 +354,8 @@ def train_model(config: TrainingConfig, args=None):
     del train_loader, initial_state
     
     # Training loop
-    print("Starting training...")
+    if master_process:
+        print("Starting training...")
     train_loader = distributed_data_generator(config.train_files, world_size * config.train_seq_len, align_to_bos=True)
     training_time_ms = 0
     timer = Timer()
@@ -395,8 +398,6 @@ def train_model(config: TrainingConfig, args=None):
                     'step_avg_ms': training_time_ms / max(step, 1)
                 }
                 logger.log(metrics)
-                print(f"step:{step}/{config.num_iterations} val_loss:{val_loss:.4f} "
-                     f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms")
             
             model.train()
             timer.start()
@@ -526,9 +527,9 @@ def main():
             if hasattr(config, key):
                 setattr(config, key, value)
     
-    print(f"Training configuration:")
+    print0(f"Training configuration:")
     for key, value in config.__dict__.items():
-        print(f"  {key}: {value}")
+        print0(f"  {key}: {value}")
     
     train_model(config, args)
 

@@ -1,3 +1,5 @@
 origin_repos
 claude_instructions
 data
+logs
+wandb

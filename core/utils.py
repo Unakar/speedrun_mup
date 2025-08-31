@@ -206,6 +206,23 @@ class SimpleLogger:
                 'total_training_time_s': total_training_time
             })
     
+    def log(self, metrics: Dict[str, Any]):
+        """Generic log method for arbitrary metrics."""
+        if not is_main_process():
+            return
+            
+        # Log to wandb if available
+        if self.wandb:
+            self.wandb.log(metrics)
+        
+        # Log to file with timestamp
+        if self.log_file:
+            import datetime
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            metrics_str = ', '.join([f"{k}={v}" for k, v in metrics.items()])
+            self.log_file.write(f"[{timestamp}] {metrics_str}\n")
+            self.log_file.flush()
+    
     def save_config(self, config: Dict[str, Any]):
         """Save experiment configuration to file."""
         if not is_main_process():
