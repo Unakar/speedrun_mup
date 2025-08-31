@@ -513,7 +513,7 @@ def main():
         base_width=args.base_width,
         num_iterations=args.iterations,
         seed=args.seed,
-        compile_model=not args.no_compile
+        compile_model=args.compile
     )
     
     # Load config file if provided
