@@ -1,21 +1,5 @@
-# Core dependencies
-torch>=2.0.0
-numpy>=1.21.0
-matplotlib>=3.5.0
-PyYAML>=6.0
-
-# Optional dependencies for logging and analysis
-wandb>=0.15.0
-tqdm>=4.64.0
-
-# Development dependencies (optional)
-pytest>=7.0.0
-black>=22.0.0
-flake8>=4.0.0
-
-# Data dependencies
-datasets>=2.0.0
-transformers>=4.20.0
-
-# Distributed training
-accelerate>=0.20.0
+numpy
+tqdm
+torch
+huggingface-hub
+wandb

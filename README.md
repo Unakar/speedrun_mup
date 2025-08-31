@@ -16,19 +16,15 @@ This project combines the state-of-the-art training optimizations from modded-na
 
 ```
 speedrun_mup/
-├── core/                    # Core implementation modules
-│   ├── model.py            # GPT architecture (exact modded-nanogpt replica)
+├── core/                   
+│   ├── model.py            # modded-nanogpt arch
 │   ├── mup.py              # MuP scaling and dimension tracking
 │   ├── optimizers.py       # Muon and DistAdam optimizers
 │   └── utils.py            # Logging, metrics, and utilities
-├── scripts/                # Training and experiment scripts
-│   └── train.py           # Main training script with MuP support
-├── configs/                # Experiment configurations
-│   └── width_sweep.yaml   # MuP scaling experiment template
-├── claude_instructions/    # Project background documentation
-└── origin_repos/          # Reference implementations
-    ├── modded-nanogpt/
-    └── mup/
+├── scripts/                
+│   └── data                # data download & tokenize
+└── train.py                # Start training!
+    
 ```
 
 ## Usage
@@ -38,7 +34,7 @@ speedrun_mup/
 Train a GPT model with standard hyperparameters:
 
 ```bash
-python scripts/train.py --width 768 --iterations 1750
+python train.py --width 768 --iterations 1750
 ```
 
 ### MuP Scaling Experiments
@@ -47,10 +43,10 @@ Train with MuP for zero-shot hyperparameter transfer:
 
 ```bash
 # Base model (width 768)
-python scripts/train.py --mup --width 768 --base-width 768 --iterations 1750
+python train.py --mup --width 768 --base-width 768 --iterations 1750
 
 # Larger model with transferred hyperparameters
-python scripts/train.py --mup --width 1024 --base-width 768 --iterations 1750
+python train.py --mup --width 1024 --base-width 768 --iterations 1750
 ```
 
 ### Distributed Training
@@ -58,7 +54,7 @@ python scripts/train.py --mup --width 1024 --base-width 768 --iterations 1750
 For multi-GPU systems:
 
 ```bash
-torchrun --nproc_per_node=8 scripts/train.py --mup --width 1024 --base-width 768
+torchrun --nproc_per_node=8 train.py --mup --width 1024 --base-width 768
 ```
 
 ### Configuration Options
@@ -107,12 +103,6 @@ Training includes all modded-nanogpt optimizations:
 
 The implementation includes coordinate checking functionality to validate MuP correctness. Proper MuP implementations should show stable activation magnitudes across different model widths.
 
-## Requirements
-
-- PyTorch 2.5+ with CUDA support
-- FlexAttention support (requires recent PyTorch nightly for some features)
-- Distributed training: NCCL backend for multi-GPU setups
-- Optional: wandb for experiment tracking
 
 ## References
 

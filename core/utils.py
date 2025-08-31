@@ -50,94 +50,171 @@ def is_main_process() -> bool:
 
 # Logging and metrics
 
-class MetricsLogger:
-    """Simple metrics logger with W&B support."""
+def print0(*args, console=False, **kwargs):
+    """Print only on main process (rank 0), modded-nanogpt style."""
+    if is_main_process():
+        if console:
+            print(*args, **kwargs, flush=True)
+        else:
+            print(*args, **kwargs)
+
+
+def generate_experiment_name(prefix: str = "", config: Dict[str, Any] = None) -> str:
+    """Generate timestamp-based experiment name."""
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    def __init__(self, project_name: str = "speedrun-mup", use_wandb: bool = True,
-                 log_dir: Optional[str] = None):
+    # Add config-based suffix
+    suffix_parts = []
+    if config:
+        if config.get('mup', False):
+            suffix_parts.append("mup")
+        if 'width' in config:
+            suffix_parts.append(f"w{config['width']}")
+        if 'base_width' in config and config.get('mup', False):
+            suffix_parts.append(f"base{config['base_width']}")
+    
+    # Combine parts
+    name_parts = [p for p in [prefix, timestamp] + suffix_parts if p]
+    return "_".join(name_parts)
+
+
+class SimpleLogger:
+    """Simple logger aligned with modded-nanogpt style."""
+    
+    def __init__(self, use_wandb: bool = False, project_name: str = "speedrun-mup",
+                 experiment_name: str = None, config: Dict[str, Any] = None):
         self.use_wandb = use_wandb
-        self.log_dir = log_dir
-        self.step_count = 0
-        self.metrics_buffer = {}
+        self.wandb = None
+        self.start_time = time.time()
+        self.experiment_name = experiment_name or generate_experiment_name("speedrun", config)
         
-        # Rolling averages
-        self.rolling_metrics: Dict[str, Deque] = defaultdict(lambda: deque(maxlen=100))
+        # Create logs directory with experiment name
+        self.log_dir = f"logs/{self.experiment_name}"
+        if is_main_process():
+            os.makedirs(self.log_dir, exist_ok=True)
         
         # Initialize wandb if available and requested
         if use_wandb and is_main_process():
             try:
                 import wandb
-                wandb.init(project=project_name, config={})
+                wandb.init(
+                    project=project_name, 
+                    name=self.experiment_name,
+                    config=config or {}
+                )
                 self.wandb = wandb
-                print("Initialized W&B logging")
+                print0(f"Initialized W&B logging: {project_name}/{self.experiment_name}")
             except ImportError:
-                print("wandb not available, using local logging only")
-                self.wandb = None
+                print0("wandb not available, skipping")
                 self.use_wandb = False
-        else:
-            self.wandb = None
-            
-        # Create log directory
-        if log_dir and is_main_process():
-            os.makedirs(log_dir, exist_ok=True)
-            self.log_file = open(os.path.join(log_dir, 'metrics.jsonl'), 'a')
-        else:
-            self.log_file = None
+        
+        # Initialize log file
+        self.log_file = None
+        if is_main_process():
+            log_file_path = os.path.join(self.log_dir, "training.log")
+            self.log_file = open(log_file_path, 'w')
+        
+        # Log experiment info
+        self.log_experiment_start(config)
     
-    def log(self, metrics: Dict[str, Any], step: Optional[int] = None):
-        """Log metrics."""
+    def log_experiment_start(self, config: Dict[str, Any] = None):
+        """Log experiment start information."""
         if not is_main_process():
             return
-            
-        if step is None:
-            step = self.step_count
-            self.step_count += 1
         
-        # Add to rolling averages
-        for key, value in metrics.items():
-            if isinstance(value, (int, float)):
-                self.rolling_metrics[key].append(value)
+        import sys
+        import datetime
         
-        # Log to wandb
-        if self.wandb:
-            self.wandb.log(metrics, step=step)
+        start_msg = [
+            f"=" * 80,
+            f"Experiment: {self.experiment_name}",
+            f"Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Log directory: {self.log_dir}",
+            f"Python: {sys.version}",
+            f"PyTorch: {torch.__version__}",
+            f"Hardware: {get_gpu_name()}",
+            f"=" * 80,
+        ]
         
-        # Log to file
+        if config:
+            start_msg.extend([
+                "Configuration:",
+                json.dumps(config, indent=2, default=str),
+                "=" * 80,
+            ])
+        
+        for line in start_msg:
+            print0(line, console=True)
+            if self.log_file:
+                self.log_file.write(line + '\n')
+                self.log_file.flush()
+    
+    def log_step(self, step: int, total_steps: int, training_time_ms: float, 
+                 val_loss: Optional[float] = None, **kwargs):
+        """Log training step in modded-nanogpt style."""
+        step_avg = training_time_ms / max(step, 1)
+        
+        if val_loss is not None:
+            msg = f"step:{step}/{total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms"
+        else:
+            msg = f"step:{step}/{total_steps} train_time:{training_time_ms:.0f}ms step_avg:{step_avg:.2f}ms"
+        
+        print0(msg, console=True)
+        
+        # Also log to file with timestamp
         if self.log_file:
-            log_entry = {'step': step, 'timestamp': time.time(), **metrics}
-            self.log_file.write(json.dumps(log_entry) + '\n')
+            import datetime
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            self.log_file.write(f"[{timestamp}] {msg}\n")
             self.log_file.flush()
         
-        # Store in buffer for console output
-        self.metrics_buffer.update(metrics)
+        # Log to wandb if available
+        if self.wandb:
+            log_dict = {
+                'step': step,
+                'training_time_ms': training_time_ms,
+                'step_avg_ms': step_avg,
+                **kwargs
+            }
+            if val_loss is not None:
+                log_dict['val_loss'] = val_loss
+            self.wandb.log(log_dict, step=step)
     
-    def get_avg(self, key: str, default: float = 0.0) -> float:
-        """Get rolling average of metric."""
-        values = self.rolling_metrics.get(key, [])
-        return sum(values) / len(values) if values else default
+    def log_final_stats(self, peak_memory_mb: int, reserved_memory_mb: int, 
+                       total_training_time: float):
+        """Log final statistics."""
+        final_msg = [
+            f"peak memory allocated: {peak_memory_mb} MiB reserved: {reserved_memory_mb} MiB",
+            f"total training time: {format_time(total_training_time)}",
+            f"experiment completed: {self.experiment_name}",
+            "=" * 80
+        ]
+        
+        for line in final_msg:
+            print0(line, console=True)
+            if self.log_file:
+                import datetime
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                self.log_file.write(f"[{timestamp}] {line}\n")
+                self.log_file.flush()
+        
+        if self.wandb:
+            self.wandb.log({
+                'peak_memory_mb': peak_memory_mb,
+                'reserved_memory_mb': reserved_memory_mb,
+                'total_training_time_s': total_training_time
+            })
     
-    def print_metrics(self, keys: Optional[list] = None):
-        """Print current metrics to console."""
+    def save_config(self, config: Dict[str, Any]):
+        """Save experiment configuration to file."""
         if not is_main_process():
             return
-            
-        if keys is None:
-            keys = ['loss', 'lr', 'grad_norm', 'tokens_per_sec']
         
-        metrics_str = []
-        for key in keys:
-            if key in self.metrics_buffer:
-                value = self.metrics_buffer[key]
-                if isinstance(value, float):
-                    metrics_str.append(f"{key}={value:.4f}")
-                else:
-                    metrics_str.append(f"{key}={value}")
-            elif key in self.rolling_metrics:
-                avg = self.get_avg(key)
-                metrics_str.append(f"{key}_avg={avg:.4f}")
-        
-        if metrics_str:
-            print(f"Step {self.step_count}: {', '.join(metrics_str)}")
+        config_path = os.path.join(self.log_dir, "config.json")
+        with open(config_path, 'w') as f:
+            json.dumps(config, f, indent=2, default=str)
+        print0(f"Saved config to: {config_path}")
     
     def close(self):
         """Clean up logging."""
@@ -148,36 +225,31 @@ class MetricsLogger:
 
 
 class Timer:
-    """Simple timer for measuring step times."""
+    """Simple timer aligned with modded-nanogpt approach."""
     
     def __init__(self):
         self.start_time = None
-        self.step_times = deque(maxlen=100)
     
     def start(self):
-        """Start timing."""
-        self.start_time = time.time()
+        """Start timing with CUDA sync."""
+        torch.cuda.synchronize()
+        self.start_time = time.perf_counter()
     
     def stop(self) -> float:
-        """Stop timing and return step time."""
+        """Stop timing and return elapsed time in seconds."""
         if self.start_time is None:
             return 0.0
         
-        step_time = time.time() - self.start_time
-        self.step_times.append(step_time)
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - self.start_time
         self.start_time = None
-        return step_time
+        return elapsed
     
-    def avg_time(self) -> float:
-        """Get average step time."""
-        return sum(self.step_times) / len(self.step_times) if self.step_times else 0.0
-    
-    def throughput(self, batch_size: int, seq_len: int) -> float:
-        """Calculate tokens per second."""
-        avg_time = self.avg_time()
-        if avg_time > 0:
-            return (batch_size * seq_len) / avg_time
-        return 0.0
+    def elapsed_ms(self) -> float:
+        """Get elapsed time in milliseconds without stopping."""
+        if self.start_time is None:
+            return 0.0
+        return 1000 * (time.perf_counter() - self.start_time)
 
 
 def compute_grad_norm(model: torch.nn.Module) -> float:
@@ -188,6 +260,159 @@ def compute_grad_norm(model: torch.nn.Module) -> float:
             param_norm = param.grad.data.norm(2)
             total_norm += param_norm.item() ** 2
     return total_norm ** 0.5
+
+
+def compute_param_norm(model: torch.nn.Module) -> float:
+    """Compute global parameter norm."""
+    total_norm = 0.0
+    for param in model.parameters():
+        param_norm = param.data.norm(2)
+        total_norm += param_norm.item() ** 2
+    return total_norm ** 0.5
+
+
+def compute_weight_spectral_norms(model: torch.nn.Module) -> Dict[str, float]:
+    """Compute spectral norms for weight matrices (2D parameters)."""
+    spectral_norms = {}
+    for name, param in model.named_parameters():
+        if param.dim() >= 2 and 'weight' in name:
+            # Compute spectral norm (largest singular value)
+            with torch.no_grad():
+                if param.dim() == 2:
+                    spectral_norm = torch.linalg.matrix_norm(param, ord=2).item()
+                else:
+                    # For higher-dim tensors, flatten to 2D
+                    param_2d = param.view(param.size(0), -1)
+                    spectral_norm = torch.linalg.matrix_norm(param_2d, ord=2).item()
+                spectral_norms[name] = spectral_norm
+    return spectral_norms
+
+
+def compute_activation_stats(activations: torch.Tensor, name: str = "activation") -> Dict[str, float]:
+    """Compute activation distribution statistics."""
+    with torch.no_grad():
+        flat_act = activations.view(-1)
+        return {
+            f"{name}_mean": flat_act.mean().item(),
+            f"{name}_std": flat_act.std().item(),
+            f"{name}_max": flat_act.max().item(),
+            f"{name}_min": flat_act.min().item(),
+            f"{name}_l2_norm": flat_act.norm(2).item(),
+        }
+
+
+class ActivationHook:
+    """Hook to capture activation statistics during forward pass."""
+    
+    def __init__(self):
+        self.activations = {}
+        self.hooks = []
+    
+    def register_hooks(self, model: torch.nn.Module, layer_names: list = None):
+        """Register hooks on specified layers or all ReLU/GELU layers."""
+        if layer_names is None:
+            # Auto-register on activation layers
+            for name, module in model.named_modules():
+                if isinstance(module, (torch.nn.ReLU, torch.nn.GELU, torch.nn.SiLU)):
+                    hook = module.register_forward_hook(self._make_hook(name))
+                    self.hooks.append(hook)
+        else:
+            for name in layer_names:
+                module = dict(model.named_modules())[name]
+                hook = module.register_forward_hook(self._make_hook(name))
+                self.hooks.append(hook)
+    
+    def _make_hook(self, name: str):
+        def hook(module, input, output):
+            if isinstance(output, torch.Tensor):
+                self.activations[name] = compute_activation_stats(output, name)
+        return hook
+    
+    def get_stats(self) -> Dict[str, float]:
+        """Get accumulated activation statistics."""
+        stats = {}
+        for layer_stats in self.activations.values():
+            stats.update(layer_stats)
+        return stats
+    
+    def clear(self):
+        """Clear stored activations."""
+        self.activations.clear()
+    
+    def remove_hooks(self):
+        """Remove all registered hooks."""
+        for hook in self.hooks:
+            hook.remove()
+        self.hooks.clear()
+
+
+class TrainingMonitor:
+    """Performance-aware training monitor for advanced metrics."""
+    
+    def __init__(self, model: torch.nn.Module, monitor_interval: int = 100,
+                 enable_spectral_norms: bool = False, enable_activation_stats: bool = False):
+        self.model = model
+        self.monitor_interval = monitor_interval
+        self.enable_spectral_norms = enable_spectral_norms
+        self.enable_activation_stats = enable_activation_stats
+        self.step_count = 0
+        
+        # Activation hooks (expensive, use sparingly)
+        self.activation_hook = None
+        if enable_activation_stats:
+            self.activation_hook = ActivationHook()
+            self.activation_hook.register_hooks(model)
+    
+    def should_monitor(self, step: int = None) -> bool:
+        """Check if we should collect expensive metrics this step."""
+        if step is not None:
+            return step % self.monitor_interval == 0
+        self.step_count += 1
+        return self.step_count % self.monitor_interval == 0
+    
+    def get_basic_metrics(self) -> Dict[str, float]:
+        """Get lightweight metrics (always computed)."""
+        return {
+            'grad_norm': compute_grad_norm(self.model),
+            'param_norm': compute_param_norm(self.model)
+        }
+    
+    def get_advanced_metrics(self) -> Dict[str, float]:
+        """Get expensive metrics (use sparingly)."""
+        metrics = {}
+        
+        if self.enable_spectral_norms:
+            spectral_norms = compute_weight_spectral_norms(self.model)
+            # Log max, mean, and specific layers
+            if spectral_norms:
+                values = list(spectral_norms.values())
+                metrics.update({
+                    'spectral_norm_max': max(values),
+                    'spectral_norm_mean': sum(values) / len(values),
+                    'spectral_norm_std': torch.tensor(values).std().item()
+                })
+        
+        if self.enable_activation_stats and self.activation_hook:
+            activation_stats = self.activation_hook.get_stats()
+            metrics.update(activation_stats)
+            self.activation_hook.clear()
+        
+        return metrics
+    
+    def get_all_metrics(self, step: int = None) -> Dict[str, float]:
+        """Get appropriate metrics based on monitoring schedule."""
+        metrics = self.get_basic_metrics()
+        
+        if self.should_monitor(step):
+            advanced = self.get_advanced_metrics()
+            metrics.update(advanced)
+        
+        return metrics
+    
+    def close(self):
+        """Clean up hooks."""
+        if self.activation_hook:
+            self.activation_hook.remove_hooks()
 
 
 def get_model_info(model: torch.nn.Module) -> Dict[str, int]:
@@ -264,22 +489,50 @@ def format_time(seconds: float) -> str:
         return f"{seconds/3600:.1f}h"
 
 
+def get_gpu_name() -> str:
+    """Get GPU name for hardware detection."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_name(torch.cuda.current_device())
+    return "unknown"
+
+
+def get_peak_flops(gpu_name: str = None) -> float:
+    """Get theoretical peak FLOPS for different hardware."""
+    if gpu_name is None:
+        gpu_name = get_gpu_name().lower()
+    else:
+        gpu_name = gpu_name.lower()
+    
+    # Hardware-specific peak FLOPS (bfloat16/fp16)
+    if "h100" in gpu_name:
+        return 989e12  # H100 SXM: 989 TFLOPS
+    elif "b200" in gpu_name or "blackwell" in gpu_name:
+        return 2500e12  # B200: ~2500 TFLOPS (estimated)
+    elif "a100" in gpu_name:
+        return 312e12  # A100: 312 TFLOPS
+    elif "v100" in gpu_name:
+        return 125e12  # V100: 125 TFLOPS
+    else:
+        # Default to H100 since modded-nanogpt targets 8xH100
+        return 989e12
+
+
 def estimate_mfu(model_params: int, batch_size: int, seq_len: int, step_time: float) -> float:
     """
     Estimate model flops utilization (MFU).
-    Simplified calculation based on transformer forward pass.
+    Auto-detects hardware for appropriate peak FLOPS.
     """
+    if step_time <= 0:
+        return 0.0
+    
     # Approximate FLOPs per token (6 * model_params for forward + backward)
     flops_per_token = 6 * model_params
     flops_per_step = flops_per_token * batch_size * seq_len
     
-    # Theoretical peak FLOPS (A100: 312 TFLOPS for bfloat16)
-    peak_flops = 312e12
+    # Get hardware-appropriate peak FLOPS
+    peak_flops = get_peak_flops()
     
-    # Actual FLOPS achieved
-    if step_time > 0:
-        actual_flops = flops_per_step / step_time
-        mfu = actual_flops / peak_flops
-        return min(mfu, 1.0)  # Cap at 100%
-    
-    return 0.0
+    # Calculate MFU
+    actual_flops = flops_per_step / step_time
+    mfu = actual_flops / peak_flops
+    return min(mfu, 1.0)  # Cap at 100%
