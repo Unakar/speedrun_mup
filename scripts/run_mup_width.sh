@@ -40,8 +40,9 @@ if [ "$GPU_COUNT" -ne 8 ]; then
     echo "Warning: Expected 8 GPUs, found $GPU_COUNT"
 fi
 
-if [ ! -d "data" ] || [ ! -f "data/finewebedu_train_000001.bin" ]; then
-    echo "Error: Training data not found"
+if [ ! -d "data" ] || [ ! -f "data/finewebedu10B/finewebedu_train_000001.bin" ]; then
+    echo "Error: Training data not found in data/"
+    echo "Run: bash /root/xietian/dev/speedrun_mup/scripts/data_process/download_hf_data.sh"
     exit 1
 fi
 

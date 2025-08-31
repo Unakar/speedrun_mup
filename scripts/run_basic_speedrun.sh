@@ -27,9 +27,9 @@ if [ "$GPU_COUNT" -ne 8 ]; then
 fi
 
 # Check data
-if [ ! -d "data" ] || [ ! -f "data/finewebedu_train_000001.bin" ]; then
+if [ ! -d "data" ] || [ ! -f "data/finewebedu10B/finewebedu_train_000001.bin" ]; then
     echo "Error: Training data not found in data/"
-    echo "Run: python scripts/data_process/download_cached_finewebedu_10B.py"
+    echo "Run: bash /root/xietian/dev/speedrun_mup/scripts/data_process/download_hf_data.sh"
     exit 1
 fi
 
