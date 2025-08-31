@@ -53,7 +53,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.model import GPT, GPTConfig
 from core.mup import MuPConfig, set_base_shapes, apply_mup_to_model, MuReadout
 from core.optimizers import create_mup_muon_optimizer, step_optimizers, zero_grad_optimizers, apply_lr_schedule, apply_momentum_warmup
-from core.utils import MetricsLogger, Timer, compute_grad_norm, get_model_info, set_seed
+from core.utils import SimpleLogger, Timer, compute_grad_norm, get_model_info, set_seed
 from core import mup  # For initialization functions
 
 
