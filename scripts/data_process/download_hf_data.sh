@@ -1,1 +1,1 @@
-huggingface-cli download --repo-type dataset --resume-download kjj0/finewebedu10B-gpt2 --local-dir  /home/t2vg-a100-G2-1/a_xietian/dev/speedrun_mup/data/finewebedu10B
+huggingface-cli download --repo-type dataset --resume-download kjj0/finewebedu10B-gpt2 --local-dir  data/finewebedu10B
