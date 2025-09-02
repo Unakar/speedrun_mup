@@ -257,7 +257,7 @@ def train_model(config: TrainingConfig, args=None):
     
     # Create model
     if master_process:
-        print(f"Creating model with width {config.model_dim}...")
+        print(f"Creating model...")
     model = create_model(config)
     
     if master_process:
@@ -516,7 +516,6 @@ def main():
     
     # Create config
     config = TrainingConfig(
-        model_dim=args.width,
         num_iterations=args.iterations,
         seed=args.seed,
         compile_model=args.compile,
