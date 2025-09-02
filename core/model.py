@@ -282,7 +282,7 @@ class GPT(nn.Module):
             torch.ones(pad),
         ]))
         
-        # set learning rates (will be used by MuP)
+        # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
         for param in self.value_embeds.parameters():

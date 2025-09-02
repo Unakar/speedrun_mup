@@ -1,44 +1,14 @@
 #!/bin/bash
 # Basic speedrun training - single-node 8-GPU H100 setup
 # Comprehensive training script with full configuration support
-#
-# Usage:
-#   bash run_basic_speedrun.sh [WIDTH] [ITERATIONS] [SEED] [TRAIN_DATA] [VAL_DATA]
-#
-# Environment Variables:
-#   BATCH_SIZE=8            # Batch size per GPU  
-#   SEQUENCE_LENGTH=1024    # Sequence length
-#   LEARNING_RATE=3e-4      # Learning rate
-#   WEIGHT_DECAY=0.1        # Weight decay
-#   GRAD_CLIP=1.0           # Gradient clipping
-#   WARMUP_STEPS=100        # Warmup steps
-#   VAL_EVERY=100           # Validation interval
-#   SAVE_EVERY=500          # Save checkpoint interval
-#   LOG_EVERY=10            # Logging interval
-#   USE_WANDB=true          # Enable W&B logging
-#   WANDB_PROJECT="speedrun-basic"  # W&B project name
-#   WANDB_NAME=""           # W&B run name (optional)
-#   MONITOR_SPECTRAL_EVERY=0  # Monitor spectral norms every N steps (0=disabled)
-#   MONITOR_ACTIVATIONS=false # Enable activation statistics monitoring
-#   MONITOR_ACTIVATIONS_EVERY=100  # Monitor activations every N steps
-#   COMPILE=true            # Enable model compilation
-#   MUP=false               # Enable MuP scaling
-#   BASE_WIDTH=768          # MuP base width
-#
-# Examples:
-#   bash run_basic_speedrun.sh 768 1750 1337
-#   LEARNING_RATE=1e-4 bash run_basic_speedrun.sh 1024 2000 42
-#   MUP=true BASE_WIDTH=512 bash run_basic_speedrun.sh 1024 1750 1337
-#   MONITOR_SPECTRAL_EVERY=100 bash run_basic_speedrun.sh 768 1750 1337  # Enable spectral monitoring
 
 set -e
 
 # Default configuration (8xH100 optimized)
-WIDTH=${1:-768}
-ITERATIONS=${2:-1750}
-SEED=${3:-1337}
-TRAIN_DATA=${4:-"data/finewebedu10B/finewebedu_train_*.bin"}
-VAL_DATA=${5:-"data/finewebedu10B/finewebedu_val_*.bin"}
+ITERATIONS=${ITERATIONS:-1750}
+SEED=${SEED:-1337}
+TRAIN_DATA=${TRAIN_DATA:-"data/finewebedu10B/finewebedu_train_*.bin"}
+VAL_DATA=${VAL_DATA:-"data/finewebedu10B/finewebedu_val_*.bin"}
 
 # Advanced training parameters
 BATCH_SIZE=${BATCH_SIZE:-8}
@@ -54,7 +24,7 @@ SAVE_EVERY=${SAVE_EVERY:-500}
 LOG_EVERY=${LOG_EVERY:-10}
 USE_WANDB=${USE_WANDB:-true}
 WANDB_PROJECT=${WANDB_PROJECT:-"speedrun-basic"}
-WANDB_NAME=${WANDB_NAME:-""}
+WANDB_NAME=${WANDB_NAME:-"exp1"}
 
 # Advanced monitoring (expensive metrics)
 MONITOR_SPECTRAL_EVERY=${MONITOR_SPECTRAL_EVERY:-100}  # 0=disabled, 100=every 100 steps
@@ -64,11 +34,10 @@ MONITOR_ACTIVATIONS_EVERY=${MONITOR_ACTIVATIONS_EVERY:-100}
 # System options
 COMPILE=${COMPILE:-true}
 MUP=${MUP:-false}
-BASE_WIDTH=${BASE_WIDTH:-768}
 
 echo "=========================================="
 echo "Basic Speedrun Training"
-echo "Width: $WIDTH | Iterations: $ITERATIONS | Seed: $SEED"
+echo "Iterations: $ITERATIONS | Seed: $SEED"
 echo "Training Data: $TRAIN_DATA"
 echo "Validation Data: $VAL_DATA"
 echo "Batch Size: $BATCH_SIZE | Seq Length: $SEQUENCE_LENGTH"
@@ -107,10 +76,9 @@ TRAIN_CMD=(
     train.py
     --train-data "$TRAIN_DATA"
     --val-data "$VAL_DATA"
-    --width $WIDTH
     --iterations $ITERATIONS
     --seed $SEED
-    --batch-size $BATCH_SIZE
+    --batch-size-per-gpu $BATCH_SIZE
     --sequence-length $SEQUENCE_LENGTH
     --learning-rate $LEARNING_RATE
     --weight-decay $WEIGHT_DECAY
@@ -129,11 +97,6 @@ TRAIN_CMD=(
 # Add activation monitoring if enabled
 if [ "$MONITOR_ACTIVATIONS" = "true" ]; then
     TRAIN_CMD+=(--monitor-activations)
-fi
-
-# Add MuP parameters if enabled
-if [ "$MUP" = "true" ]; then
-    TRAIN_CMD+=(--mup --base-width $BASE_WIDTH)
 fi
 
 # Add wandb run name if specified

@@ -1,30 +1,15 @@
 #!/usr/bin/env python3
 """
-Training script for speedrun-mup: modded-nanogpt with MuP integration.
-
-This script implements the complete training pipeline from modded-nanogpt
-with added MuP (Maximal Update Parameterization) support for scaling experiments.
+Training script for speedrun: modded-nanogpt implementation.
 
 Key features:
 - Exact modded-nanogpt architecture and training procedure
-- MuP scaling for zero-shot hyperparameter transfer
 - Distributed training with 8xH100 support
 - FP8 mixed precision training
 - FlexAttention with sliding window
 - U-net skip connections
 - Value embeddings
 - Muon optimizer
-- Comprehensive logging and checkpointing
-
-Usage:
-    # Standard training
-    python scripts/train.py --config configs/gpt_small.yaml
-    
-    # MuP scaling experiment
-    python scripts/train.py --config configs/mup_width_sweep.yaml --mup --width 1024
-    
-    # Distributed training
-    torchrun --nproc_per_node=8 scripts/train.py --config configs/gpt_small.yaml
 """
 
 import os
@@ -51,10 +36,8 @@ from torch import Tensor
 # Import our components
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.model import GPT, GPTConfig
-from core.mup import MuPConfig, set_base_shapes, apply_mup_to_model, MuReadout
-from core.optimizers import create_mup_muon_optimizer, step_optimizers, zero_grad_optimizers, apply_lr_schedule, apply_momentum_warmup
+from core.optimizers import Muon
 from core.utils import SimpleLogger, Timer, compute_grad_norm, compute_param_norm, compute_weight_spectral_norms, ActivationHook, get_model_info, set_seed, print0
-from core import mup  # For initialization functions
 
 
 # -----------------------------------------------------------------------------
@@ -81,14 +64,6 @@ class TrainingConfig:
     cooldown_frac: float = 0.45
     val_loss_every: int = 125
     save_checkpoint: bool = False
-    
-    # MuP settings
-    use_mup: bool = False
-    base_width: int = 768
-    target_width: int = 768
-    base_model_path: str = ""
-    delta_model_path: str = ""
-    mup_base_shapes_file: str = ""
     
     # System
     compile_model: bool = True
@@ -182,10 +157,41 @@ def get_window_size_blocks(step: int, num_iterations: int):
 
 
 # -----------------------------------------------------------------------------
-# Model creation and MuP setup
+# Optimizer utilities
+
+def apply_lr_schedule(optimizers, step, num_iterations, cooldown_frac=0.45):
+    """Apply learning rate schedule to optimizers."""
+    x = step / num_iterations
+    assert 0 <= x < 1
+    if x < 1 - cooldown_frac:
+        lr_mult = 1.0
+    else:
+        w = (1 - x) / cooldown_frac
+        lr_mult = w * 1.0 + (1 - w) * 0.1
+    
+    for opt in optimizers:
+        for group in opt.param_groups:
+            if "initial_lr" not in group:
+                group["initial_lr"] = group["lr"]
+            group["lr"] = group["initial_lr"] * lr_mult
+
+
+def apply_momentum_warmup(optimizers, step, warmup_steps=300):
+    """Apply momentum warmup to Muon optimizers."""
+    frac = min(step / warmup_steps, 1)
+    target_momentum = (1 - frac) * 0.85 + frac * 0.95
+    
+    for opt in optimizers:
+        if isinstance(opt, Muon):
+            for group in opt.param_groups:
+                group["momentum"] = target_momentum
+
+
+# -----------------------------------------------------------------------------
+# Model creation
 
 def create_model(config: TrainingConfig) -> nn.Module:
-    """Create model with MuP support."""
+    """Create model."""
     # Create model config
     model_config = GPTConfig(
         vocab_size=config.vocab_size,
@@ -197,56 +203,6 @@ def create_model(config: TrainingConfig) -> nn.Module:
     
     # Create model
     model = GPT(model_config).cuda()
-    
-    # Apply MuP if requested
-    if config.use_mup:
-        mup_config = MuPConfig(
-            use_mup=True,
-            base_width=config.base_width,
-            target_width=config.target_width
-        )
-        
-        # Set base shapes
-        if config.mup_base_shapes_file and os.path.exists(config.mup_base_shapes_file):
-            # Load from saved base shapes
-            set_base_shapes(model, config.mup_base_shapes_file)
-        else:
-            # Create base shapes from base and delta models
-            base_config = GPTConfig(
-                vocab_size=config.vocab_size,
-                num_layers=config.num_layers,
-                num_heads=config.num_heads,
-                model_dim=config.base_width,
-                max_seq_len=model_config.max_seq_len
-            )
-            base_model = GPT(base_config)
-            
-            # Create delta model (slightly different width for shape inference)
-            delta_config = GPTConfig(
-                vocab_size=config.vocab_size,
-                num_layers=config.num_layers,
-                num_heads=config.num_heads,
-                model_dim=config.base_width + 64,  # Small difference for shape inference
-                max_seq_len=model_config.max_seq_len
-            )
-            delta_model = GPT(delta_config)
-            
-            # Set base shapes
-            set_base_shapes(model, base_model, delta=delta_model,
-                           savefile=config.mup_base_shapes_file if config.mup_base_shapes_file else None)
-            
-            del base_model, delta_model
-        
-        # Apply MuP modifications
-        model = apply_mup_to_model(model, mup_config)
-        
-        # Initialize with MuP-aware initialization
-        for module in model.modules():
-            if isinstance(module, nn.Linear):
-                if hasattr(module.weight, 'infshape'):
-                    mup.kaiming_normal_(module.weight, nonlinearity='relu')
-                if hasattr(module, 'bias') and module.bias is not None:
-                    nn.init.zeros_(module.bias)
     
     # Apply modded-nanogpt specific initialization
     for m in model.modules():
@@ -292,7 +248,7 @@ def train_model(config: TrainingConfig, args=None):
         if args:
             logger = SimpleLogger(
                 use_wandb=args.use_wandb, 
-                project_name=args.wandb_project or "speedrun-mup",
+                project_name=args.wandb_project or "speedrun",
                 experiment_name=args.wandb_name,
                 config=vars(args)
             )
@@ -307,16 +263,13 @@ def train_model(config: TrainingConfig, args=None):
     if master_process:
         model_info = get_model_info(model)
         print(f"Model: {model_info['total_params']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
-        if config.use_mup:
-            print(f"MuP enabled: base_width={config.base_width}, target_width={config.target_width}")
     
     # Initialize activation monitoring if enabled
-    activation_monitor = None
-    if config.monitor_activations:
-        activation_monitor = ActivationHook()
-        activation_monitor.register_hooks(model)
-        if master_process:
-            print(f"Enabled activation monitoring every {config.monitor_activations_every} steps")
+    activation_hook = None
+    if config.monitor_activations and master_process:
+        activation_hook = ActivationHook()
+        activation_hook.register_hooks(model)
+        print(f"Enabled activation monitoring every {config.monitor_activations_every} steps")
     
     # Collect parameters for optimization
     hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
@@ -324,21 +277,11 @@ def train_model(config: TrainingConfig, args=None):
     scalar_params = [p for p in model.parameters() if p.ndim < 2]
     head_params = [model.lm_head.weight] if hasattr(model, 'lm_head') else []
     
-    # Create optimizers
-    if config.use_mup:
-        # Use MuP-aware optimizers
-        optimizer1 = torch.optim.AdamW(scalar_params + head_params + embed_params, 
-                                     lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-        from core.optimizers import Muon
-        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
-        optimizers = [optimizer1, optimizer2]
-    else:
-        # Standard optimizers from modded-nanogpt
-        optimizer1 = torch.optim.AdamW(scalar_params + head_params + embed_params, 
-                                     lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-        from core.optimizers import Muon  
-        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
-        optimizers = [optimizer1, optimizer2]
+    # Create optimizers (standard from modded-nanogpt)
+    optimizer1 = torch.optim.AdamW(scalar_params + head_params + embed_params, 
+                                 lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+    optimizers = [optimizer1, optimizer2]
     
     for opt in optimizers:
         for group in opt.param_groups:
@@ -358,8 +301,10 @@ def train_model(config: TrainingConfig, args=None):
     for _ in range(config.warmup_steps):
         inputs, targets = next(train_loader)
         model(inputs, targets, get_window_size_blocks(1, config.num_iterations)).backward()
-        step_optimizers(optimizers)
-        zero_grad_optimizers(optimizers)
+        for opt in optimizers:
+            opt.step()
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
     
     model.load_state_dict(initial_state["model"])
     for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
@@ -383,7 +328,7 @@ def train_model(config: TrainingConfig, args=None):
         # Validation
         if last_step or (config.val_loss_every > 0 and step % config.val_loss_every == 0):
             torch.cuda.synchronize()
-            training_time_ms += 1000 * timer.stop() if timer.start_time else 0
+            training_time_ms += 1000 * (time.perf_counter() - timer.start_time) if timer.start_time else 0
             model.eval()
             
             val_batch_size = world_size * config.val_seq_len
@@ -410,7 +355,11 @@ def train_model(config: TrainingConfig, args=None):
                     'train_time_ms': training_time_ms,
                     'step_avg_ms': training_time_ms / max(step, 1)
                 }
-                logger.log(metrics)
+                if logger:
+                    logger.log_step(step, config.num_iterations, training_time_ms, val_loss.item())
+                    logger.log(metrics)
+                else:
+                    print(f"step:{step}/{config.num_iterations} val_loss:{val_loss.item():.4f} train_time:{training_time_ms:.0f}ms")
             
             model.train()
             timer.start()
@@ -430,7 +379,16 @@ def train_model(config: TrainingConfig, args=None):
         
         # Training step
         inputs, targets = next(train_loader)
+        
+        # Forward pass with activation collection if enabled
+        if activation_hook and master_process and step % config.monitor_activations_every == 0:
+            activation_hook.clear()
+        
         train_loss = model(inputs, targets, get_window_size_blocks(step, config.num_iterations))
+        
+        # Normalize train loss for logging (convert from sum to mean)
+        train_loss_normalized = train_loss.item() / (config.train_seq_len * world_size)
+        
         train_loss.backward()
         
         # Update learning rates and momentum
@@ -438,26 +396,29 @@ def train_model(config: TrainingConfig, args=None):
         apply_momentum_warmup(optimizers, step, warmup_steps=300)
         
         # Compute grad norm before optimizer step
-        grad_norm = compute_grad_norm(model) if step >= 0 else 0.0
+        grad_norm = compute_grad_norm(model) if master_process else 0.0
         
         # Compute param norm (lightweight metric)
-        param_norm = compute_param_norm(model)
+        param_norm = compute_param_norm(model) if master_process else 0.0
         
         # Optimizer step
-        step_optimizers(optimizers)
-        zero_grad_optimizers(optimizers)
+        for opt in optimizers:
+            opt.step()
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         
         # Log training metrics
         if master_process and step % 10 == 0:
-            approx_training_time_ms = training_time_ms + 1000 * timer.avg_time()
+            approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - timer.start_time)
             metrics = {
-                'step': step + 1,
+                'step': step,
                 'approx_train_time_ms': approx_training_time_ms,
-                'step_avg_ms': approx_training_time_ms / (step + 1),
+                'step_avg_ms': approx_training_time_ms / max(step, 1),
                 'grad_norm': grad_norm,
                 'param_norm': param_norm,
                 'lr': optimizers[0].param_groups[0]['lr'],
-                'train_loss': train_loss.item()
+                'momentum': optimizers[1].param_groups[0]['momentum'] if len(optimizers) > 1 and isinstance(optimizers[1], Muon) else 0.95,
+                'train_loss': train_loss_normalized  # Use normalized loss
             }
             
             # Add expensive spectral norm metrics if configured
@@ -475,18 +436,20 @@ def train_model(config: TrainingConfig, args=None):
                     })
             
             # Add activation statistics if configured
-            if (activation_monitor is not None and 
-                config.monitor_activations_every > 0 and
+            if (activation_hook is not None and 
                 step % config.monitor_activations_every == 0):
-                activation_stats = activation_monitor.get_stats()
-                metrics.update(activation_stats)
-                activation_monitor.clear()  # Clear for next collection
+                activation_stats = activation_hook.get_stats()
+                if activation_stats:  # Only log if we have stats
+                    metrics.update(activation_stats)
             
-            logger.log(metrics)
+            if logger:
+                logger.log(metrics)
+            
             if step % 100 == 0:
-                print(f"step:{step+1}/{config.num_iterations} "
+                print(f"step:{step}/{config.num_iterations} "
+                     f"loss:{train_loss_normalized:.4f} "
                      f"train_time:{approx_training_time_ms:.0f}ms "
-                     f"step_avg:{approx_training_time_ms/(step + 1):.2f}ms")
+                     f"step_avg:{approx_training_time_ms/max(step, 1):.2f}ms")
     
     # Final statistics
     torch.cuda.synchronize()
@@ -495,18 +458,15 @@ def train_model(config: TrainingConfig, args=None):
     if master_process:
         peak_mem = torch.cuda.max_memory_allocated() // 1024 // 1024
         reserved_mem = torch.cuda.max_memory_reserved() // 1024 // 1024
-        final_metrics = {
-            'peak_memory_mb': peak_mem,
-            'reserved_memory_mb': reserved_mem,
-            'total_time_s': total_time
-        }
-        logger.log(final_metrics)
+        if logger:
+            logger.log_final_stats(peak_mem, reserved_mem, total_time)
+            logger.close()
         print(f"peak memory allocated: {peak_mem} MiB reserved: {reserved_mem} MiB")
-        logger.close()
+        print(f"total training time: {total_time:.1f}s")
     
     # Clean up activation monitoring
-    if activation_monitor is not None:
-        activation_monitor.remove_hooks()
+    if activation_hook is not None:
+        activation_hook.remove_hooks()
     
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -516,13 +476,8 @@ def train_model(config: TrainingConfig, args=None):
 # Main entry point
 
 def main():
-    parser = argparse.ArgumentParser(description='Train GPT model with MuP support')
+    parser = argparse.ArgumentParser(description='Train GPT model (speedrun)')
     parser.add_argument('--config', type=str, help='Path to config file')
-    
-    # MuP options
-    parser.add_argument('--mup', action='store_true', help='Enable MuP scaling')
-    parser.add_argument('--width', type=int, default=768, help='Model width')
-    parser.add_argument('--base-width', type=int, default=768, help='Base model width for MuP')
     
     # Data options
     parser.add_argument('--train-data', type=str, default="data/finewebedu10B/finewebedu_train_*.bin", help='Training data path pattern')
@@ -530,7 +485,7 @@ def main():
     
     # Training options
     parser.add_argument('--iterations', type=int, default=1750, help='Number of training iterations')
-    parser.add_argument('--batch-size', type=int, default=8, help='Batch size per GPU')
+    parser.add_argument('--batch-size-per-gpu', type=int, default=8, help='Batch size per GPU')
     parser.add_argument('--sequence-length', type=int, default=1024, help='Sequence length')
     parser.add_argument('--learning-rate', '--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--weight-decay', type=float, default=0.1, help='Weight decay')
@@ -543,13 +498,9 @@ def main():
     parser.add_argument('--log-every', type=int, default=10, help='Logging interval')
     parser.add_argument('--log-dir', type=str, help='Log directory')
     
-    # Coordinate checking
-    parser.add_argument('--coord-check', action='store_true', help='Enable coordinate checking')
-    parser.add_argument('--coord-check-every', type=int, default=100, help='Coordinate check interval')
-    
     # W&B logging
     parser.add_argument('--use-wandb', type=lambda x: x.lower() == 'true', default=False, help='Use Weights & Biases')
-    parser.add_argument('--wandb-project', type=str, help='W&B project name')
+    parser.add_argument('--wandb-project', type=str, default='speedrun', help='W&B project name')
     parser.add_argument('--wandb-name', type=str, help='W&B run name')
     
     # Advanced monitoring
@@ -565,15 +516,13 @@ def main():
     
     # Create config
     config = TrainingConfig(
-        use_mup=args.mup,
         model_dim=args.width,
-        target_width=args.width,
-        base_width=args.base_width,
         num_iterations=args.iterations,
         seed=args.seed,
         compile_model=args.compile,
         train_files=args.train_data,
         val_files=args.val_data,
+        val_loss_every=args.val_every,
         monitor_spectral_every=args.monitor_spectral_every,
         monitor_activations=args.monitor_activations,
         monitor_activations_every=args.monitor_activations_every

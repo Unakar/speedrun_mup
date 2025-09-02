@@ -12,12 +12,8 @@ __version__ = "0.1.0"
 __all__ = [
     "GPT",
     "GPTConfig", 
-    "apply_mup",
-    "MuPConfig",
     "SimpleLogger",
     "TrainingMonitor",
     "compute_grad_norm",
-    "estimate_mfu",
     "create_muon_optimizer",
-    "create_mup_muon_optimizer",
 ]

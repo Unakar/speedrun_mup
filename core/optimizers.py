@@ -248,45 +248,6 @@ def create_muon_optimizer(model_parameters, lr: float = 0.05, weight_decay: floa
     return optimizers
 
 
-def create_mup_muon_optimizer(model_parameters, base_lr: float = 0.05, weight_decay: float = 0.0, 
-                             momentum: float = 0.95, use_mup: bool = True):
-    """Create MuP-aware Muon optimizer combination."""
-    from .mup import MuAdamW
-    
-    # Separate matrix-like and non-matrix parameters
-    matrix_params = []
-    other_params = []
-    
-    for param in model_parameters:
-        if param.dim() >= 2 and param.numel() >= 128:
-            matrix_params.append(param)
-        else:
-            other_params.append(param)
-    
-    optimizers = []
-    
-    if matrix_params:
-        if use_mup and hasattr(matrix_params[0], 'infshape'):
-            # Use MuP scaling for matrix parameters, but still with Muon
-            muon_opt = Muon(matrix_params, lr=base_lr, weight_decay=weight_decay, momentum=momentum)
-            optimizers.append(muon_opt)
-        else:
-            # Standard Muon without MuP
-            muon_opt = Muon(matrix_params, lr=base_lr, weight_decay=weight_decay, momentum=momentum)
-            optimizers.append(muon_opt)
-    
-    if other_params:
-        if use_mup and hasattr(other_params[0], 'infshape'):
-            # Use MuP-aware AdamW for other parameters
-            adam_opt = MuAdamW(other_params, lr=base_lr*0.16, weight_decay=0.0, betas=(0.8, 0.95), eps=1e-10)
-            optimizers.append(adam_opt)
-        else:
-            # Standard AdamW
-            adam_opt = torch.optim.AdamW(other_params, lr=base_lr*0.16, weight_decay=0.0, betas=(0.8, 0.95), eps=1e-10)
-            optimizers.append(adam_opt)
-    
-    return optimizers
-
 
 def step_optimizers(optimizers: List[torch.optim.Optimizer]):
     """Step all optimizers in the list."""
